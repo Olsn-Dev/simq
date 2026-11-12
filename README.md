@@ -16,6 +16,7 @@
 
 ![SimQ with the queue on the left and a request open on the right](docs/screenshot.jpg)
 
+- **Files included.** Upload CAD files and reports through the app, or just link to where they are.
 - **No server.** The team syncs through a private GitHub repository or a shared folder.
 - **Works offline.** Changes are sent when the network is back.
 - **No clashes.** If two people take the same request at the same time, everyone ends up with the same winner.
@@ -38,13 +39,14 @@ There is no server of its own. The app on your computer syncs with everyone else
 3. When the simulation is done they click "Mark as done" and fill in where the report and the results are, plus a short summary.
 4. Everyone on the team sees the same list and can open the report and results from there.
 
-The app never stores any files for you. It only saves a link or a description of where the file is:
+For every file (input, report, results) you choose how to point to it. You can upload the file through the app, or just save a link or a description of where it is:
 
 | Kind | What you fill in |
 | --- | --- |
 | Google Drive | A link starting with `http://` or `https://` |
 | Vault | A short description, e.g. `Uprights/v3/Assembly.iam` |
 | Other | Free text, e.g. `The USB stick in the workshop drawer` |
+| Upload file | Choose a file on your computer (at most 500 MB). Everyone on the team can then download it from the request |
 
 ## Get started with GitHub
 
@@ -133,6 +135,17 @@ The repository (or the shared folder) has a folder `ops/` with one small file pe
 
 A request cannot be edited afterwards either. If something went wrong: delete the request and add a new one.
 
+### Uploaded files
+
+Choose **Upload file** as the kind for the input when you create a request, or for the report and results when you mark it as done. Whoever takes the request opens it and clicks **Download** to save the file to their computer.
+
+- A file can be at most 500 MB. Zip large assemblies first.
+- With GitHub the files are stored under **Releases** in the team's data repository (releases named `simq-files-…`), not in the repository itself. Never edit or delete those releases by hand.
+- Uploading happens in the background and is queued if you are offline. Until an upload has finished, others who try to download are asked to try again in a moment.
+- Everyone with the team key can download every file.
+- Every download is checked against a checksum, so a damaged or altered file is never saved. The app never opens or runs the files.
+- Team members on a version older than 0.4.0 do not see requests that use uploaded files until they update.
+
 ### Deleting a request
 
 Open the request and click **Delete…**. The request disappears from the list for everyone on the team, and this cannot be undone. Anyone with the team key can delete. Nothing is removed from the repository: the deletion is just another event, and deleted requests are listed under **Settings → Diagnostics**.
@@ -191,4 +204,4 @@ Keep the app's source code in a different repository from the team's data, and n
 - With GitHub the app works against a local copy of `ops/`, and a background thread keeps the copy and the repository equal through the GitHub REST API: new files in the repository are downloaded, new local files are uploaded as one commit each. The team key is stored in plain text in the app's settings file on the computer.
 - Everything coming from outside is treated as untrusted input: files over 64 KiB, broken JSON, unknown fields and files with the wrong name or path are ignored. Only `http://` and `https://` links can be clicked.
 
-The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui`.
+The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `blobs` (uploaded files), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui`.

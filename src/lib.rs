@@ -10,6 +10,7 @@
 //! - `config` – local configuration and identity
 //! - `ui`     – the egui user interface
 
+pub mod blobs;
 pub mod config;
 pub mod github;
 pub mod hlc;

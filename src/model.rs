@@ -122,16 +122,24 @@ pub enum LocKind {
     Drive,
     Vault,
     Other,
+    /// A file uploaded through the app.
+    File,
 }
 
 impl LocKind {
-    pub const ALL: [LocKind; 3] = [LocKind::Drive, LocKind::Vault, LocKind::Other];
+    pub const ALL: [LocKind; 4] = [
+        LocKind::Drive,
+        LocKind::Vault,
+        LocKind::Other,
+        LocKind::File,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             LocKind::Drive => "drive",
             LocKind::Vault => "vault",
             LocKind::Other => "other",
+            LocKind::File => "file",
         }
     }
 
@@ -140,6 +148,7 @@ impl LocKind {
             "drive" => LocKind::Drive,
             "vault" => LocKind::Vault,
             "other" => LocKind::Other,
+            "file" => LocKind::File,
             _ => return None,
         })
     }
@@ -149,6 +158,7 @@ impl LocKind {
             LocKind::Drive => "Google Drive",
             LocKind::Vault => "Vault",
             LocKind::Other => t("Annat", "Other"),
+            LocKind::File => t("Ladda upp fil", "Upload file"),
         }
     }
 
@@ -163,6 +173,7 @@ impl LocKind {
                 "t.ex. USB-stickan i verkstadslådan",
                 "e.g. the USB stick in the workshop drawer",
             ),
+            LocKind::File => "",
         }
     }
 
@@ -173,6 +184,7 @@ impl LocKind {
             }
             LocKind::Vault => t("Beskriv kort var i Vault filen ligger.", "Briefly describe where in Vault the file is."),
             LocKind::Other => t("Fri text: beskriv var filen finns.", "Free text: describe where the file is."),
+            LocKind::File => t("Filen laddas upp och kan hämtas av alla i laget. Högst 500 MB.", "The file is uploaded and can be downloaded by everyone on the team. At most 500 MB."),
         }
     }
 }
@@ -243,6 +255,13 @@ pub fn parse_location(kind: &str, value: &str) -> Result<Option<Location>, Strin
         return Err(t(
             "en Google Drive-plats måste vara en länk som börjar med http:// eller https://",
             "a Google Drive location must be a link starting with http:// or https://",
+        )
+        .to_string());
+    }
+    if kind == LocKind::File && crate::blobs::FileRef::parse(value).is_none() {
+        return Err(t(
+            "ogiltig referens till en uppladdad fil",
+            "invalid reference to an uploaded file",
         )
         .to_string());
     }

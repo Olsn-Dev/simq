@@ -11,13 +11,14 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::blobs;
 use crate::i18n::t;
 use crate::ops::{self, FORMAT_FILE, FORMAT_VERSION, MAX_FILE_BYTES, OPS_DIR};
 
@@ -77,6 +78,8 @@ pub enum RemoteError {
     Conflict,
     /// The file already exists.
     Exists,
+    /// An uploaded file is not in the store (yet).
+    FileMissing,
     Other(String),
 }
 
@@ -100,6 +103,11 @@ impl RemoteError {
             RemoteError::Conflict => t(
                 "GitHub var upptaget. Försöker igen.",
                 "GitHub was busy. Trying again.",
+            )
+            .to_string(),
+            RemoteError::FileMissing => t(
+                "Filen finns inte uppladdad än. Den som lade upp den kanske fortfarande laddar upp. Försök igen om en stund.",
+                "The file has not been uploaded yet. Whoever added it may still be uploading. Try again in a moment.",
             )
             .to_string(),
             RemoteError::Exists => t("Filen finns redan.", "The file already exists.").to_string(),
@@ -131,6 +139,16 @@ pub trait RemoteStore: Send {
     fn download(&mut self, path: &str) -> Result<Vec<u8>, RemoteError>;
     /// Creates a NEW file. `Exists` if it is already there.
     fn upload(&mut self, path: &str, bytes: &[u8]) -> Result<(), RemoteError>;
+    /// Uploads a user file under its SHA-256. Does nothing if it is already there.
+    fn upload_file(&mut self, sha256: &str, path: &Path) -> Result<(), RemoteError>;
+    /// Downloads a user file to `dest`, accepting at most `size` bytes.
+    fn download_file(
+        &mut self,
+        sha256: &str,
+        size: u64,
+        dest: &Path,
+        progress: &AtomicU64,
+    ) -> Result<(), RemoteError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +157,8 @@ pub trait RemoteStore: Send {
 
 pub struct GithubRemote {
     agent: ureq::Agent,
+    /// For file transfers, which may take a long time.
+    transfer: ureq::Agent,
     base: String,
     repo: String,
     token: String,
@@ -263,6 +283,11 @@ impl GithubRemote {
     pub fn with_base(base: &str, config: &GithubConfig) -> Self {
         GithubRemote {
             agent: agent(),
+            transfer: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(8))
+                .timeout_read(Duration::from_secs(120))
+                .timeout_write(Duration::from_secs(120))
+                .build(),
             base: base.trim_end_matches('/').to_string(),
             repo: config.repo.clone(),
             token: config.token.clone(),
@@ -305,8 +330,11 @@ impl GithubRemote {
     }
 
     fn request(&self, method: &str, url: &str) -> ureq::Request {
-        self.agent
-            .request(method, url)
+        self.headers(self.agent.request(method, url))
+    }
+
+    fn headers(&self, request: ureq::Request) -> ureq::Request {
+        request
             .set("Authorization", &format!("Bearer {}", self.token))
             .set("Accept", "application/vnd.github+json")
             .set("X-GitHub-Api-Version", "2022-11-28")
@@ -314,7 +342,188 @@ impl GithubRemote {
     }
 }
 
+#[derive(Deserialize)]
+struct ReleaseInfo {
+    id: u64,
+    upload_url: String,
+}
+
+#[derive(Deserialize)]
+struct AssetInfo {
+    id: u64,
+    name: String,
+    url: String,
+    size: u64,
+    #[serde(default)]
+    state: String,
+}
+
+/// User files are stored as release assets, spread over up to 256 releases
+/// (one per first byte of the SHA-256) to stay well below GitHub's limit on
+/// the number of files per release.
+fn file_bucket(sha256: &str) -> String {
+    format!("simq-files-{}", &sha256[..2])
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(response: ureq::Response) -> Result<T, RemoteError> {
+    let body = response
+        .into_string()
+        .map_err(|e| RemoteError::Offline(e.to_string()))?;
+    serde_json::from_str(&body).map_err(|e| RemoteError::Other(e.to_string()))
+}
+
+impl GithubRemote {
+    /// Finds the release that holds files for `tag`, creating it if asked to.
+    fn file_release(&self, tag: &str, create: bool) -> Result<Option<ReleaseInfo>, RemoteError> {
+        let by_tag = format!("{}/repos/{}/releases/tags/{tag}", self.base, self.repo);
+        match self.request("GET", &by_tag).call() {
+            Ok(response) => return parse_json(response).map(Some),
+            Err(ureq::Error::Status(404, _)) if create => {}
+            Err(ureq::Error::Status(404, _)) => return Ok(None),
+            Err(e) => return Err(classify(e)),
+        }
+        let body = serde_json::json!({
+            "tag_name": tag,
+            "target_commitish": self.branch,
+            "name": format!("SimQ files {}", tag.rsplit('-').next().unwrap_or_default()),
+            "body": "Files uploaded through SimQ. Managed by the app, do not edit by hand.",
+            "prerelease": true,
+        });
+        let url = format!("{}/repos/{}/releases", self.base, self.repo);
+        match self
+            .request("POST", &url)
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+        {
+            Ok(response) => parse_json(response).map(Some),
+            // Someone else created it at the same moment.
+            Err(ureq::Error::Status(422, _)) => self
+                .request("GET", &by_tag)
+                .call()
+                .map_err(classify)
+                .and_then(parse_json)
+                .map(Some),
+            Err(e) => Err(classify(e)),
+        }
+    }
+
+    fn find_asset(&self, release_id: u64, name: &str) -> Result<Option<AssetInfo>, RemoteError> {
+        for page in 1..=20 {
+            let url = format!(
+                "{}/repos/{}/releases/{release_id}/assets?per_page=100&page={page}",
+                self.base, self.repo
+            );
+            let assets: Vec<AssetInfo> =
+                parse_json(self.request("GET", &url).call().map_err(classify)?)?;
+            if assets.is_empty() {
+                break;
+            }
+            if let Some(asset) = assets.into_iter().find(|asset| asset.name == name) {
+                return Ok(Some(asset));
+            }
+        }
+        Ok(None)
+    }
+}
+
 impl RemoteStore for GithubRemote {
+    fn upload_file(&mut self, sha256: &str, path: &Path) -> Result<(), RemoteError> {
+        if !blobs::valid_sha256(sha256) {
+            return Err(RemoteError::Other(
+                t("ogiltig sökväg", "invalid path").to_string(),
+            ));
+        }
+        let size = std::fs::metadata(path)
+            .map_err(|e| RemoteError::Other(e.to_string()))?
+            .len();
+        let release = self
+            .file_release(&file_bucket(sha256), true)?
+            .ok_or(RemoteError::NotFound)?;
+        let complete = |asset: &AssetInfo| asset.state == "uploaded" && asset.size == size;
+        if let Some(asset) = self.find_asset(release.id, sha256)? {
+            if complete(&asset) {
+                return Ok(());
+            }
+            // A previous upload was interrupted: remove the remains and start over.
+            let url = format!(
+                "{}/repos/{}/releases/assets/{}",
+                self.base, self.repo, asset.id
+            );
+            self.request("DELETE", &url).call().map_err(classify)?;
+        }
+        let upload = release.upload_url.split('{').next().unwrap_or_default();
+        let url = format!("{upload}?name={sha256}");
+        let file = std::fs::File::open(path).map_err(|e| RemoteError::Other(e.to_string()))?;
+        let sent = self
+            .headers(self.transfer.request("POST", &url))
+            .set("Content-Type", "application/octet-stream")
+            .set("Content-Length", &size.to_string())
+            .send(file);
+        match sent.map_err(classify) {
+            Ok(_) => Ok(()),
+            // Someone else uploaded the same file at the same moment.
+            Err(RemoteError::Exists) => match self.find_asset(release.id, sha256)? {
+                Some(asset) if complete(&asset) => Ok(()),
+                _ => Err(RemoteError::Conflict),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    fn download_file(
+        &mut self,
+        sha256: &str,
+        size: u64,
+        dest: &Path,
+        progress: &AtomicU64,
+    ) -> Result<(), RemoteError> {
+        if !blobs::valid_sha256(sha256) {
+            return Err(RemoteError::Other(
+                t("ogiltig sökväg", "invalid path").to_string(),
+            ));
+        }
+        let Some(release) = self.file_release(&file_bucket(sha256), false)? else {
+            return Err(RemoteError::FileMissing);
+        };
+        let Some(asset) = self
+            .find_asset(release.id, sha256)?
+            .filter(|asset| asset.state == "uploaded")
+        else {
+            return Err(RemoteError::FileMissing);
+        };
+        let response = self
+            .headers(self.transfer.get(&asset.url))
+            .set("Accept", "application/octet-stream")
+            .call()
+            .map_err(classify)?;
+        let save = |e: std::io::Error| RemoteError::Other(e.to_string());
+        let mut reader = response.into_reader().take(size + 1);
+        let mut file = std::fs::File::create(dest).map_err(save)?;
+        let mut buffer = vec![0u8; 256 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = reader
+                .read(&mut buffer)
+                .map_err(|e| RemoteError::Offline(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > size {
+                return Err(RemoteError::Other(
+                    t(
+                        "filen är större än väntat",
+                        "the file is larger than expected",
+                    )
+                    .to_string(),
+                ));
+            }
+            std::io::Write::write_all(&mut file, &buffer[..n]).map_err(save)?;
+            progress.store(total, Ordering::Relaxed);
+        }
+        file.sync_all().map_err(save)
+    }
+
     fn list(&mut self, etag: Option<&str>) -> Result<Listing, RemoteError> {
         let url = format!(
             "{}/repos/{}/git/trees/{}?recursive=1",
@@ -438,6 +647,9 @@ pub struct MirrorReport {
     pub uploaded: usize,
     /// Local events that are not yet in the repository.
     pub pending: usize,
+    pub files_uploaded: usize,
+    /// Local user files that are not yet uploaded.
+    pub pending_files: usize,
     pub error: Option<RemoteError>,
 }
 
@@ -567,6 +779,23 @@ pub fn mirror_once(
     let local = ops::scan_ops(folder)
         .map(|scan| scan.entries)
         .unwrap_or_default();
+    // User files go first, so that an event never points to a file that is not there yet.
+    if report.error.is_none() && state.listed && !state.remote_newer {
+        for (sha256, path) in blobs::local_files(folder) {
+            match remote.upload_file(&sha256, &path) {
+                Ok(()) => {
+                    // Uploaded: the local copy is no longer needed.
+                    let _ = std::fs::remove_file(&path);
+                    report.files_uploaded += 1;
+                }
+                Err(e) => {
+                    report.error = Some(e);
+                    break;
+                }
+            }
+        }
+    }
+    report.pending_files = blobs::local_files(folder).len();
     if report.error.is_none() && state.listed && !state.remote_newer {
         if !state.known.contains(FORMAT_FILE) {
             if let Some(bytes) = read_limited(&folder.join(FORMAT_FILE)) {
@@ -624,6 +853,8 @@ pub struct RemoteStatus {
     pub state: RemoteState,
     /// Local changes waiting to be sent.
     pub pending: usize,
+    /// Uploaded files waiting to be sent.
+    pub pending_files: usize,
     pub last_ok_ms: Option<u64>,
 }
 
@@ -633,6 +864,7 @@ impl RemoteStatus {
             repo: repo.to_string(),
             state: RemoteState::Starting,
             pending: 0,
+            pending_files: 0,
             last_ok_ms: None,
         }
     }
@@ -692,6 +924,7 @@ pub fn spawn_transport(
                         repo: repo.clone(),
                         state: state_now,
                         pending: round.pending,
+                        pending_files: round.pending_files,
                         last_ok_ms,
                     },
                     round.downloaded > 0,
@@ -729,6 +962,7 @@ mod tests {
         offline: bool,
         conflicts: usize,
         downloads: usize,
+        blobs: BTreeMap<String, Vec<u8>>,
     }
 
     #[derive(Clone, Default)]
@@ -793,6 +1027,45 @@ mod tests {
             repo.files.insert(path.to_string(), bytes.to_vec());
             repo.version += 1;
             Ok(())
+        }
+
+        fn upload_file(&mut self, sha256: &str, path: &Path) -> Result<(), RemoteError> {
+            self.offline()?;
+            let bytes = std::fs::read(path).map_err(|e| RemoteError::Other(e.to_string()))?;
+            self.repo().blobs.insert(sha256.to_string(), bytes);
+            Ok(())
+        }
+
+        fn download_file(
+            &mut self,
+            sha256: &str,
+            size: u64,
+            dest: &Path,
+            progress: &AtomicU64,
+        ) -> Result<(), RemoteError> {
+            self.offline()?;
+            let bytes = self
+                .repo()
+                .blobs
+                .get(sha256)
+                .cloned()
+                .ok_or(RemoteError::FileMissing)?;
+            if bytes.len() as u64 > size {
+                return Err(RemoteError::Other("too large".to_string()));
+            }
+            std::fs::write(dest, &bytes).map_err(|e| RemoteError::Other(e.to_string()))?;
+            progress.store(bytes.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl FakeRemote {
+        fn offline(&self) -> Result<(), RemoteError> {
+            if self.repo().offline {
+                Err(RemoteError::Offline("inget nät".to_string()))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1013,6 +1286,140 @@ mod tests {
     }
 
     #[test]
+    fn uploaded_files_follow_the_request() {
+        use crate::blobs::{self, FileRef};
+        use crate::model::LocKind;
+        use crate::ops::NewAction;
+        use crate::sync::FileSlot;
+
+        let remote = FakeRemote::default();
+        let mut a = Member::new("Anna", &remote);
+        let mut b = Member::new("Bo", &remote);
+        a.round();
+        let desk = TempDir::new();
+        let cad = desk.path().join("Monokock åäö.step");
+        let cad_bytes = vec![7u8; 300_000];
+        std::fs::write(&cad, &cad_bytes).unwrap();
+
+        // Anna creates a request with an uploaded CAD file as input.
+        let mut create = create_action("Vridstyvhet");
+        if let NewAction::Create { input, .. } = &mut create {
+            *input = None;
+        }
+        let id =
+            match a
+                .client
+                .submit_with_files(None, create, vec![(FileSlot::Input, cad.clone())])
+            {
+                Ok(Submitted::Applied { request_id, .. }) => request_id,
+                other => panic!("unexpected: {other:?}"),
+            };
+        assert_eq!(blobs::local_files(a.dir.path()).len(), 1);
+        let op_text = a.client.store().ops()[0].json.clone();
+        assert!(op_text.contains("\"v\": 2"), "{op_text}");
+
+        // The file is uploaded before the event, and the local copy is then removed.
+        let report = a.round();
+        assert_eq!(
+            (report.files_uploaded, report.uploaded, report.pending_files),
+            (1, 1, 0)
+        );
+        assert!(blobs::local_files(a.dir.path()).is_empty());
+        assert_eq!(remote.repo().blobs.len(), 1);
+
+        // Bo sees the request and can download exactly the same file.
+        b.round();
+        let input = b.client.state().requests[&id].input.clone().unwrap();
+        assert_eq!(input.kind, LocKind::File);
+        let file = FileRef::parse(&input.value).unwrap();
+        assert_eq!(file.name, "Monokock åäö.step");
+        assert_eq!(file.size, 300_000);
+        let saved = desk.path().join("nedladdad.step");
+        let progress = AtomicU64::new(0);
+        blobs::fetch(b.dir.path(), Some(&mut b.remote), &file, &saved, &progress).unwrap();
+        assert_eq!(std::fs::read(&saved).unwrap(), cad_bytes);
+        assert_eq!(progress.load(Ordering::Relaxed), 300_000);
+
+        // Bo finishes offline with an uploaded report and a Vault description.
+        remote.repo().offline = true;
+        let report_file = desk.path().join("Rapport.pdf");
+        std::fs::write(&report_file, b"%PDF report").unwrap();
+        b.submit(Some(id), &take_action("Bo"));
+        let finish = NewAction::Finish {
+            assignee: "Bo".to_string(),
+            report: None,
+            results: Some(crate::model::Location {
+                kind: LocKind::Vault,
+                value: "Chassi/Results".to_string(),
+            }),
+            summary: "Klart".to_string(),
+        };
+        match b
+            .client
+            .submit_with_files(Some(id), finish, vec![(FileSlot::Report, report_file)])
+        {
+            Ok(Submitted::Applied { .. }) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        let round = b.round();
+        assert_eq!((round.pending_files, round.pending), (1, 2));
+        // Until it is uploaded, others are told to wait.
+        let report_ref =
+            FileRef::parse(&b.client.state().requests[&id].report.clone().unwrap().value).unwrap();
+        remote.repo().offline = false;
+        let early = desk.path().join("för tidigt.pdf");
+        assert!(blobs::fetch(
+            a.dir.path(),
+            Some(&mut a.remote),
+            &report_ref,
+            &early,
+            &progress
+        )
+        .unwrap_err()
+        .contains("uppladdad"));
+        assert!(!early.exists());
+
+        let round = b.round();
+        assert_eq!(
+            (
+                round.files_uploaded,
+                round.uploaded,
+                round.pending_files,
+                round.pending
+            ),
+            (1, 2, 0, 0)
+        );
+        a.round();
+        assert_eq!(a.client.state().requests[&id].status, Status::Done);
+        let got = desk.path().join("rapport.pdf");
+        blobs::fetch(
+            a.dir.path(),
+            Some(&mut a.remote),
+            &report_ref,
+            &got,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), b"%PDF report");
+
+        // A file that was tampered with in the store is refused.
+        remote
+            .repo()
+            .blobs
+            .insert(report_ref.sha256.clone(), b"%PDF forged".to_vec());
+        let forged = desk.path().join("forged.pdf");
+        assert!(blobs::fetch(
+            a.dir.path(),
+            Some(&mut a.remote),
+            &report_ref,
+            &forged,
+            &progress
+        )
+        .is_err());
+        assert!(!forged.exists());
+    }
+
+    #[test]
     fn team_keys() {
         assert_eq!(
             parse_team_key("  simq:lag-et/Sim.Q_repo:github_pat_ABC123def456  ").unwrap(),
@@ -1068,6 +1475,14 @@ mod tests {
         empty: bool,
         read_only: bool,
         requests: Vec<String>,
+        base: String,
+        releases: BTreeMap<String, u64>,
+        /// (asset id, release id, name, content, state)
+        assets: Vec<(u64, u64, String, Vec<u8>, String)>,
+    }
+
+    fn release_json(base: &str, id: u64) -> String {
+        format!("{{\"id\":{id},\"upload_url\":\"{base}/upload/{id}{{?name,label}}\"}}")
     }
 
     fn base64_decode(text: &str) -> Vec<u8> {
@@ -1147,9 +1562,82 @@ mod tests {
         if header("user-agent").is_none() || header("x-github-api-version").is_none() {
             return respond(stream, 400, "", b"{}");
         }
+        if let Some(upload) = target.strip_prefix("/upload/") {
+            // Like uploads.github.com: needs a Content-Length, no chunked bodies.
+            let (release, name) = upload.split_once("?name=").unwrap_or_default();
+            if method != "POST"
+                || header("transfer-encoding").is_some()
+                || header("content-type").as_deref() != Some("application/octet-stream")
+            {
+                return respond(stream, 400, "", b"{}");
+            }
+            if server.assets.iter().any(|a| a.2 == name) {
+                return respond(stream, 422, "", b"{}");
+            }
+            let id = 1000 + server.assets.len() as u64;
+            let release: u64 = release.parse().unwrap_or(0);
+            server
+                .assets
+                .push((id, release, name.to_string(), body, "uploaded".to_string()));
+            return respond(stream, 201, "", b"{}");
+        }
         let Some(rest) = target.strip_prefix("/repos/lag/simq") else {
             return respond(stream, 404, "", b"{}");
         };
+        if let Some(tag) = rest.strip_prefix("/releases/tags/") {
+            return match server.releases.get(tag) {
+                Some(id) => respond(stream, 200, "", release_json(&server.base, *id).as_bytes()),
+                None => respond(stream, 404, "", b"{}"),
+            };
+        }
+        if method == "POST" && rest == "/releases" {
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let tag = json["tag_name"].as_str().unwrap_or_default().to_string();
+            if json["prerelease"] != true || server.releases.contains_key(&tag) {
+                return respond(stream, 422, "", b"{}");
+            }
+            let id = 1 + server.releases.len() as u64;
+            server.releases.insert(tag, id);
+            return respond(stream, 201, "", release_json(&server.base, id).as_bytes());
+        }
+        if let Some(asset) = rest.strip_prefix("/releases/assets/") {
+            let id: u64 = asset.parse().unwrap_or(0);
+            if method == "DELETE" {
+                server.assets.retain(|a| a.0 != id);
+                return respond(stream, 204, "", b"");
+            }
+            if !header("accept")
+                .unwrap_or_default()
+                .contains("octet-stream")
+            {
+                return respond(stream, 400, "", b"{}");
+            }
+            return match server.assets.iter().find(|a| a.0 == id) {
+                Some(a) => respond(stream, 200, "", &a.3.clone()),
+                None => respond(stream, 404, "", b"{}"),
+            };
+        }
+        if let Some(listing) = rest.strip_prefix("/releases/") {
+            if let Some((release, query)) = listing.split_once("/assets?") {
+                let release: u64 = release.parse().unwrap_or(0);
+                let items: Vec<String> = if query == "per_page=100&page=1" {
+                    server
+                        .assets
+                        .iter()
+                        .filter(|a| a.1 == release)
+                        .map(|a| {
+                            format!(
+                                "{{\"id\":{},\"name\":\"{}\",\"url\":\"{}/repos/lag/simq/releases/assets/{}\",\"size\":{},\"state\":\"{}\"}}",
+                                a.0, a.2, server.base, a.0, a.3.len(), a.4
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                return respond(stream, 200, "", format!("[{}]", items.join(",")).as_bytes());
+            }
+        }
         if method == "GET" && rest.is_empty() {
             let body = format!(
                 "{{\"default_branch\":\"main\",\"permissions\":{{\"push\":{}}}}}",
@@ -1224,7 +1712,10 @@ mod tests {
     fn start_server() -> (String, Arc<Mutex<Server>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = Arc::new(Mutex::new(Server::default()));
+        let server = Arc::new(Mutex::new(Server {
+            base: base.clone(),
+            ..Server::default()
+        }));
         let shared = Arc::clone(&server);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -1323,6 +1814,75 @@ mod tests {
         let requests = server.lock().unwrap().requests.clone();
         assert!(requests.contains(&format!("PUT /repos/lag/simq/contents/{path}")));
         assert!(requests.contains(&"GET /repos/lag/simq/git/trees/main?recursive=1".to_string()));
+    }
+
+    #[test]
+    fn github_file_transfers() {
+        let (base, server) = start_server();
+        let mut remote = remote_at(&base, TOKEN);
+        let tmp = TempDir::new();
+        let content: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let source = tmp.path().join("källa.step");
+        std::fs::write(&source, &content).unwrap();
+        let (sha256, size) = blobs::sha256_of(&source).unwrap();
+        let progress = AtomicU64::new(0);
+        let dest = tmp.path().join("hämtad.step");
+
+        // Nothing uploaded yet.
+        assert_eq!(
+            remote.download_file(&sha256, size, &dest, &progress),
+            Err(RemoteError::FileMissing)
+        );
+
+        // Upload creates the release for the file's bucket and stores the file.
+        assert_eq!(remote.upload_file(&sha256, &source), Ok(()));
+        {
+            let server = server.lock().unwrap();
+            let tag = format!("simq-files-{}", &sha256[..2]);
+            assert!(server.releases.contains_key(&tag));
+            assert_eq!(server.assets.len(), 1);
+            assert_eq!(server.assets[0].2, sha256);
+            assert_eq!(server.assets[0].3, content);
+        }
+        // Uploading again does nothing.
+        assert_eq!(remote.upload_file(&sha256, &source), Ok(()));
+        assert_eq!(server.lock().unwrap().assets.len(), 1);
+
+        assert_eq!(
+            remote.download_file(&sha256, size, &dest, &progress),
+            Ok(())
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        assert_eq!(progress.load(Ordering::Relaxed), size);
+
+        // A file that is larger than the event says is cut off.
+        assert!(matches!(
+            remote.download_file(&sha256, size - 1, &dest, &progress),
+            Err(RemoteError::Other(_))
+        ));
+
+        // The remains of an interrupted upload are replaced.
+        server.lock().unwrap().assets[0].4 = "starter".to_string();
+        assert_eq!(
+            remote.download_file(&sha256, size, &dest, &progress),
+            Err(RemoteError::FileMissing)
+        );
+        assert_eq!(remote.upload_file(&sha256, &source), Ok(()));
+        {
+            let server = server.lock().unwrap();
+            assert_eq!(server.assets.len(), 1);
+            assert_eq!(server.assets[0].4, "uploaded");
+        }
+
+        // Names that are not a SHA-256 never reach the API.
+        assert!(matches!(
+            remote.upload_file("../evil", &source),
+            Err(RemoteError::Other(_))
+        ));
+        assert_eq!(
+            remote_at(&base, "fel-nyckel-123").upload_file(&sha256, &source),
+            Err(RemoteError::Denied)
+        );
     }
 
     #[test]

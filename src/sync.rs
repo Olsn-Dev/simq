@@ -12,11 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
+use crate::blobs;
 use crate::config::{self, Config, Paths};
 use crate::github::{self, GithubConfig, GithubRemote, RemoteStatus, Transport};
 use crate::hlc::Clock;
 use crate::i18n::{self, is_en, t, Lang};
-use crate::model::{one_line, truncate_chars, Request, MAX_NAME};
+use crate::model::{one_line, truncate_chars, LocKind, Location, Request, MAX_NAME};
 use crate::ops::{self, FolderError, NewAction, Op, ReadError};
 use crate::replay::{Outcome, State};
 use crate::store::{Seen, SeenState, Store, StoreError};
@@ -404,6 +405,44 @@ impl Client {
         Ok(Submitted::Applied { request_id, op_id })
     }
 
+    /// Like `submit`, but first takes the given files into the local file
+    /// store and points the action's locations at them. The sync then uploads
+    /// the files together with the event.
+    pub fn submit_with_files(
+        &mut self,
+        request_id: Option<Uuid>,
+        mut action: NewAction,
+        files: Vec<(FileSlot, PathBuf)>,
+    ) -> Result<Submitted, String> {
+        if files.is_empty() {
+            return self.submit(request_id, &action);
+        }
+        let folder = self.folder.clone().ok_or_else(|| {
+            t("Ingen delad mapp är vald.", "No shared folder is selected.").to_string()
+        })?;
+        ops::ensure_layout(&folder).map_err(|e| e.to_string())?;
+        for (slot, path) in files {
+            let file = blobs::import(&folder, &path)?;
+            let location = Some(Location {
+                kind: LocKind::File,
+                value: file.to_value(),
+            });
+            match (&mut action, slot) {
+                (NewAction::Create { input, .. }, FileSlot::Input) => *input = location,
+                (NewAction::Finish { report, .. }, FileSlot::Report) => *report = location,
+                (NewAction::Finish { results, .. }, FileSlot::Results) => *results = location,
+                _ => {
+                    return Err(t(
+                        "Filen passar inte till den här åtgärden.",
+                        "The file does not fit this action.",
+                    )
+                    .to_string())
+                }
+            }
+        }
+        self.submit(request_id, &action)
+    }
+
     /// "Anna took the request before you, so your change does not apply. The request is in progress (Anna)."
     fn conflict_notice(&self, op: &Op, outcome: &Outcome) -> Notice {
         let request = self.store.state().requests.get(&op.request_id);
@@ -622,6 +661,8 @@ pub enum Cmd {
         token: u64,
         request_id: Option<Uuid>,
         action: NewAction,
+        /// Files on this computer to upload and attach to the action.
+        files: Vec<(FileSlot, PathBuf)>,
     },
     Configure {
         token: u64,
@@ -637,6 +678,14 @@ pub enum Cmd {
     /// Changes language: saved in the settings and all texts are rebuilt.
     SetLanguage(Lang),
     Shutdown,
+}
+
+/// Which location of an action an uploaded file belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSlot {
+    Input,
+    Report,
+    Results,
 }
 
 /// Where the events should be synced.
@@ -762,8 +811,9 @@ impl Worker {
                     token,
                     request_id,
                     action,
+                    files,
                 }) => {
-                    let result = match self.client.submit(request_id, &action) {
+                    let result = match self.client.submit_with_files(request_id, action, files) {
                         Ok(Submitted::Applied { .. }) => {
                             self.wake_transport();
                             Ok(())
@@ -1465,6 +1515,7 @@ mod tests {
             token: 1,
             request_id: None,
             action: create_action("Upright"),
+            files: Vec::new(),
         });
         assert!(wait(1).is_err());
 
@@ -1482,6 +1533,7 @@ mod tests {
             token: 3,
             request_id: None,
             action: create_action("Upright"),
+            files: Vec::new(),
         });
         wait(3).unwrap();
         handle.send(Cmd::SyncNow);

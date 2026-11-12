@@ -3,16 +3,18 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{Local, NaiveDate, TimeZone};
 use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
+use crate::blobs::{self, FileRef};
 use crate::config::{Config, Paths};
-use crate::github::{RemoteState, RemoteStatus};
+use crate::github::{GithubRemote, RemoteState, RemoteStatus, RemoteStore};
 use crate::i18n::{self, is_en, t, Lang};
 use crate::model::{
     char_len, clean_text, is_http_url, list_order, one_line, priority_label, truncate_chars,
@@ -20,7 +22,9 @@ use crate::model::{
 };
 use crate::ops::NewAction;
 use crate::store::SeenState;
-use crate::sync::{self, Client, Cmd, Event, FolderStatus, Handle, Notice, Snapshot, Source};
+use crate::sync::{
+    self, Client, Cmd, Event, FileSlot, FolderStatus, Handle, Notice, Snapshot, Source,
+};
 use crate::theme;
 use crate::update;
 
@@ -94,12 +98,38 @@ enum SettingsTab {
 struct LocInput {
     kind: LocKind,
     value: String,
+    /// The file chosen for upload, filled in by the file picker thread.
+    picked: Arc<Mutex<Option<PickedFile>>>,
+    picking: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct PickedFile {
+    path: PathBuf,
+    name: String,
+    size: u64,
 }
 
 impl LocInput {
+    fn picked(&self) -> Option<PickedFile> {
+        self.picked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The file to upload, if this location is an uploaded file.
+    fn file(&self) -> Option<PathBuf> {
+        if self.kind == LocKind::File {
+            self.picked().map(|picked| picked.path)
+        } else {
+            None
+        }
+    }
+
     fn location(&self) -> Option<Location> {
         let value = self.value.trim();
-        if value.is_empty() {
+        if value.is_empty() || self.kind == LocKind::File {
             None
         } else {
             Some(Location {
@@ -110,6 +140,23 @@ impl LocInput {
     }
 
     fn problem(&self, what: &str, required: bool) -> Option<String> {
+        if self.kind == LocKind::File {
+            return match self.picked() {
+                None => required.then(|| format!("{what} {}", t("saknas", "is missing"))),
+                Some(picked) if picked.size > blobs::MAX_FILE_SIZE => Some(format!(
+                    "{what}: {}",
+                    t(
+                        "filen är större än 500 MB",
+                        "the file is larger than 500 MB"
+                    )
+                )),
+                Some(picked) if picked.size == 0 => Some(format!(
+                    "{what}: {}",
+                    t("filen är tom", "the file is empty")
+                )),
+                Some(_) => None,
+            };
+        }
         let value = self.value.trim();
         if value.is_empty() {
             return required.then(|| format!("{what} {}", t("saknas", "is missing")));
@@ -241,7 +288,7 @@ impl Form {
         }
     }
 
-    fn action(&self) -> (Option<Uuid>, NewAction) {
+    fn action(&self) -> (Option<Uuid>, NewAction, Vec<(FileSlot, PathBuf)>) {
         match self {
             Form::New(f) => (
                 None,
@@ -254,6 +301,11 @@ impl Form {
                     deadline: f.deadline.trim().to_string(),
                     input: f.input.location(),
                 },
+                f.input
+                    .file()
+                    .map(|path| (FileSlot::Input, path))
+                    .into_iter()
+                    .collect(),
             ),
             Form::Finish(f) => (
                 Some(f.request_id),
@@ -263,6 +315,13 @@ impl Form {
                     results: f.results.location(),
                     summary: f.summary.trim().to_string(),
                 },
+                [
+                    f.report.file().map(|path| (FileSlot::Report, path)),
+                    f.results.file().map(|path| (FileSlot::Results, path)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
             ),
             Form::Note(f) => {
                 let note = f.note.trim().to_string();
@@ -271,7 +330,7 @@ impl Form {
                     NoteKind::Cancel => NewAction::Cancel { note },
                     NoteKind::Delete => NewAction::Delete { note },
                 };
-                (Some(f.request_id), action)
+                (Some(f.request_id), action, Vec::new())
             }
         }
     }
@@ -297,6 +356,7 @@ enum UiAction {
     OpenFinish(Uuid),
     OpenNote(Uuid, NoteKind),
     OpenUrl(String),
+    Download(FileRef),
 }
 
 /// Where the in-app update stands.
@@ -342,6 +402,14 @@ pub struct App {
     update_rx: Option<Receiver<UpdateMsg>>,
     /// True if the user asked for the check (then errors are shown).
     update_manual: bool,
+    downloads: Vec<Download>,
+}
+
+/// A file being fetched to the user's computer.
+struct Download {
+    file: FileRef,
+    progress: Arc<AtomicU64>,
+    rx: Receiver<Option<Result<PathBuf, String>>>,
 }
 
 impl App {
@@ -401,6 +469,7 @@ impl App {
             update: UpdateState::Idle,
             update_rx: None,
             update_manual: false,
+            downloads: Vec::new(),
         };
         // Look for a newer version once at start-up.
         app.check_for_update(false);
@@ -594,7 +663,12 @@ impl App {
         }
     }
 
-    fn submit(&mut self, request_id: Option<Uuid>, action: NewAction) {
+    fn submit(
+        &mut self,
+        request_id: Option<Uuid>,
+        action: NewAction,
+        files: Vec<(FileSlot, PathBuf)>,
+    ) {
         let token = self.token();
         self.pending = Some(token);
         self.form_error = None;
@@ -602,7 +676,69 @@ impl App {
             token,
             request_id,
             action,
+            files,
         });
+    }
+
+    /// Asks where to save an uploaded file and fetches it in a background thread.
+    fn start_download(&mut self, file: FileRef) {
+        let Some(folder) = self.config.effective_folder(&self.paths) else {
+            return;
+        };
+        let github = self.config.github.clone();
+        let progress = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let (thread_file, thread_progress) = (file.clone(), Arc::clone(&progress));
+        let spawned = std::thread::Builder::new()
+            .name("simq-download".to_string())
+            .spawn(move || {
+                let dest = rfd::FileDialog::new()
+                    .set_title(t("Spara filen", "Save the file"))
+                    .set_file_name(&thread_file.name)
+                    .save_file();
+                let result = dest.map(|dest| {
+                    let mut remote = github.map(|config| GithubRemote::new(&config));
+                    blobs::fetch(
+                        &folder,
+                        remote.as_mut().map(|r| r as &mut dyn RemoteStore),
+                        &thread_file,
+                        &dest,
+                        &thread_progress,
+                    )
+                    .map(|()| dest)
+                });
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.downloads.push(Download { file, progress, rx });
+        }
+    }
+
+    /// Collects finished downloads and tells the user how they went.
+    fn poll_downloads(&mut self, ctx: &egui::Context) {
+        let mut still_running = Vec::new();
+        for download in std::mem::take(&mut self.downloads) {
+            match download.rx.try_recv() {
+                Ok(Some(Ok(dest))) => self.notices.push_back(Notice {
+                    title: t("Filen är sparad", "The file is saved").to_string(),
+                    text: dest.display().to_string(),
+                }),
+                Ok(Some(Err(text))) => self.notices.push_back(Notice {
+                    title: t("Filen kunde inte hämtas", "The file could not be fetched")
+                        .to_string(),
+                    text,
+                }),
+                // The save dialog was cancelled, or the thread went away.
+                Ok(None) | Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty) => still_running.push(download),
+            }
+        }
+        self.downloads = still_running;
+        if !self.downloads.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
     }
 
     /// Receives replies from the background thread and the latest snapshot.
@@ -655,6 +791,7 @@ impl App {
             }
         }
         self.snapshot = self.handle.snapshot();
+        self.poll_downloads(ctx);
 
         if let Some(rx) = &self.update_rx {
             match rx.try_recv() {
@@ -1078,6 +1215,17 @@ impl App {
                         theme::dot(ui, color);
                         ui.label(text);
                     }
+                    if let Some(download) = self.downloads.first() {
+                        let done = download.progress.load(Ordering::Relaxed);
+                        let percent = done.saturating_mul(100) / download.file.size.max(1);
+                        ui.separator();
+                        ui.spinner();
+                        ui.label(format!(
+                            "{} {}… {percent} %",
+                            t("Hämtar", "Fetching"),
+                            truncate_chars(&one_line(&download.file.name), 40)
+                        ));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.weak(one_line(&self.config.display_name));
                         if snapshot.unsupported_seen {
@@ -1488,8 +1636,8 @@ impl App {
             });
 
         if send {
-            let (request_id, action) = form.action();
-            self.submit(request_id, action);
+            let (request_id, action, files) = form.action();
+            self.submit(request_id, action, files);
         }
         if close {
             self.form_error = None;
@@ -1749,8 +1897,10 @@ impl App {
                     NewAction::Take {
                         assignee: self.config.display_name.clone(),
                     },
+                    Vec::new(),
                 ),
-                UiAction::Requeue(id) => self.submit(Some(id), NewAction::Requeue),
+                UiAction::Requeue(id) => self.submit(Some(id), NewAction::Requeue, Vec::new()),
+                UiAction::Download(file) => self.start_download(file),
                 UiAction::OpenFinish(id) => {
                     if let Some(request) =
                         self.snapshot.requests.iter().find(|r| r.request_id == id)
@@ -1845,6 +1995,9 @@ fn remote_status_ui(ui: &mut egui::Ui, remote: &RemoteStatus) {
     };
     theme::dot(ui, color);
     ui.label(text);
+    if remote.pending_files > 0 {
+        ui.weak(blobs::pending_label(remote.pending_files));
+    }
     if remote.pending > 0 {
         ui.weak(if is_en() {
             format!("· {} change(s) waiting to be sent", remote.pending)
@@ -1942,6 +2095,30 @@ fn location_field(
             None => {
                 ui.weak("–");
             }
+            Some(location) if location.kind == LocKind::File => {
+                match FileRef::parse(&location.value) {
+                    Some(file) => {
+                        ui.add(egui::Label::new(one_line(&file.name)).wrap());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    t("Uppladdad fil", "Uploaded file"),
+                                    file.size_label()
+                                ))
+                                .size(12.0)
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                            if ui.small_button(t("Ladda ner", "Download")).clicked() {
+                                actions.push(UiAction::Download(file));
+                            }
+                        });
+                    }
+                    None => {
+                        ui.weak(t("Ogiltig filreferens", "Invalid file reference"));
+                    }
+                }
+            }
             Some(location) => {
                 if is_http_url(&location.value) {
                     if ui
@@ -1991,7 +2168,14 @@ fn quick_link(
         ui.weak(label).on_hover_text(format!(
             "{}: {}",
             location.kind.label(),
-            truncate_chars(&one_line(&location.value), 200)
+            truncate_chars(
+                &one_line(
+                    &FileRef::parse(&location.value)
+                        .map(|file| file.name)
+                        .unwrap_or_else(|| location.value.clone())
+                ),
+                200
+            )
         ));
     }
 }
@@ -2007,6 +2191,40 @@ fn counter(ui: &mut egui::Ui, text: &str, max: usize) {
     }
 }
 
+/// Opens the system file picker in its own thread and stores the choice in `input`.
+fn pick_file(ctx: &egui::Context, input: &LocInput) {
+    let (picked, picking, ctx) = (
+        Arc::clone(&input.picked),
+        Arc::clone(&input.picking),
+        ctx.clone(),
+    );
+    picking.store(true, Ordering::Relaxed);
+    let done = Arc::clone(&picking);
+    let spawned = std::thread::Builder::new()
+        .name("simq-file-picker".to_string())
+        .spawn(move || {
+            let choice = rfd::FileDialog::new()
+                .set_title(t("Välj fil att ladda upp", "Choose a file to upload"))
+                .pick_file();
+            if let Some(path) = choice {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let name = blobs::safe_name(
+                    &path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+                *picked.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(PickedFile { path, name, size });
+            }
+            done.store(false, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+    if spawned.is_err() {
+        picking.store(false, Ordering::Relaxed);
+    }
+}
+
 fn loc_input_ui(ui: &mut egui::Ui, id: &str, input: &mut LocInput) {
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt(id)
@@ -2017,12 +2235,37 @@ fn loc_input_ui(ui: &mut egui::Ui, id: &str, input: &mut LocInput) {
                     ui.selectable_value(&mut input.kind, kind, kind.label());
                 }
             });
-        ui.add(
-            egui::TextEdit::singleline(&mut input.value)
-                .hint_text(input.kind.placeholder())
-                .char_limit(MAX_TEXT)
-                .desired_width(f32::INFINITY),
-        );
+        if input.kind == LocKind::File {
+            let picking = input.picking.load(Ordering::Relaxed);
+            if ui
+                .add_enabled(!picking, egui::Button::new(t("Välj fil…", "Choose file…")))
+                .clicked()
+            {
+                pick_file(ui.ctx(), input);
+            }
+            match input.picked() {
+                Some(picked) => {
+                    ui.add(
+                        egui::Label::new(format!(
+                            "{} ({})",
+                            one_line(&picked.name),
+                            blobs::size_label(picked.size)
+                        ))
+                        .truncate(),
+                    );
+                }
+                None => {
+                    ui.weak(t("Ingen fil vald", "No file chosen"));
+                }
+            }
+        } else {
+            ui.add(
+                egui::TextEdit::singleline(&mut input.value)
+                    .hint_text(input.kind.placeholder())
+                    .char_limit(MAX_TEXT)
+                    .desired_width(f32::INFINITY),
+            );
+        }
     });
     ui.weak(input.kind.help());
 }

@@ -15,14 +15,17 @@ use uuid::Uuid;
 use crate::hlc::Hlc;
 use crate::i18n::{is_en, t};
 use crate::model::{
-    char_len, parse_location, truncate_chars, valid_deadline, Location, OpKind, MAX_NAME, MAX_TEXT,
-    MAX_TITLE,
+    char_len, parse_location, truncate_chars, valid_deadline, LocKind, Location, OpKind, MAX_NAME,
+    MAX_TEXT, MAX_TITLE,
 };
 
 /// Largest allowed size of an event file.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// Highest event version this app understands.
-pub const SUPPORTED_V: u32 = 1;
+pub const SUPPORTED_V: u32 = 2;
+/// Events that refer to uploaded files use this version, so that apps too old
+/// to handle files ignore them and ask for an update instead of rejecting them.
+pub const FILES_V: u32 = 2;
 /// Highest folder format this app may write to.
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -312,7 +315,16 @@ impl Op {
                 t("fältet kind är för långt", "the field kind is too long").to_string(),
             ));
         }
-        let action = parse_action(&w.kind, w.payload);
+        let mut action = parse_action(&w.kind, w.payload);
+        if v < FILES_V && action.uses_file() {
+            action = Action::Invalid(
+                t(
+                    "uppladdade filer kräver en nyare händelseversion",
+                    "uploaded files require a newer event version",
+                )
+                .to_string(),
+            );
+        }
         Ok(Op {
             v,
             op_id: w.op_id,
@@ -386,7 +398,33 @@ fn loc_wire(loc: &Option<Location>) -> (&str, &str) {
     }
 }
 
+fn is_file(location: &Option<Location>) -> bool {
+    matches!(location, Some(l) if l.kind == LocKind::File)
+}
+
+impl Action {
+    /// True if the event refers to an uploaded file.
+    pub fn uses_file(&self) -> bool {
+        match self {
+            Action::Create(p) => is_file(&p.input),
+            Action::Finish(p) => p.report.kind == LocKind::File || is_file(&p.results),
+            _ => false,
+        }
+    }
+}
+
 impl NewAction {
+    /// True if the action refers to an uploaded file.
+    pub fn uses_file(&self) -> bool {
+        match self {
+            NewAction::Create { input, .. } => is_file(input),
+            NewAction::Finish {
+                report, results, ..
+            } => is_file(report) || is_file(results),
+            _ => false,
+        }
+    }
+
     pub fn kind(&self) -> OpKind {
         match self {
             NewAction::Create { .. } => OpKind::Create,
@@ -458,7 +496,7 @@ pub fn build_op(
     action: &NewAction,
 ) -> Result<Op, String> {
     let wire = WireOp {
-        v: SUPPORTED_V,
+        v: if action.uses_file() { FILES_V } else { 1 },
         op_id: Uuid::new_v4(),
         client_id,
         hlc,
@@ -1122,11 +1160,11 @@ mod tests {
         assert_eq!(unknown.op_id, op.op_id);
 
         let mut value: Value = serde_json::from_str(&op.json).unwrap();
-        value["v"] = json!(2);
+        value["v"] = json!(SUPPORTED_V + 1);
         value["new_field"] = json!({"a": 1});
         value["payload"] = json!("helt annat format");
         let newer = Op::parse(&value.to_string()).unwrap();
-        assert_eq!(newer.v, 2);
+        assert_eq!(newer.v, SUPPORTED_V + 1);
         assert_eq!(newer.action, Action::Unsupported);
         assert_eq!(newer.key(), op.key());
     }
@@ -1159,6 +1197,57 @@ mod tests {
         assert!(matches!(
             ensure_layout(broken.path()),
             Err(FolderError::BadFormat(_))
+        ));
+    }
+
+    #[test]
+    fn uploaded_files_need_the_newer_event_version() {
+        let sha = "ab".repeat(32);
+        let file = Location {
+            kind: LocKind::File,
+            value: format!("sha256:{sha}:1234:Monokock.step"),
+        };
+        let with_file = NewAction::Create {
+            title: "T".to_string(),
+            description: String::new(),
+            sim_type: String::new(),
+            priority: 2,
+            requester: "A".to_string(),
+            deadline: String::new(),
+            input: Some(file.clone()),
+        };
+        let op = build_op(Uuid::new_v4(), hlc(1, 0), "A", Uuid::new_v4(), &with_file).unwrap();
+        assert_eq!(op.v, FILES_V);
+        assert!(matches!(&op.action, Action::Create(p) if p.input == Some(file)));
+
+        // Events without files keep version 1, so older apps still read them.
+        let plain = build_op(
+            Uuid::new_v4(),
+            hlc(1, 0),
+            "A",
+            Uuid::new_v4(),
+            &create_action("T"),
+        )
+        .unwrap();
+        assert_eq!(plain.v, 1);
+
+        // A version 1 event may not refer to an uploaded file.
+        let mut value: Value = serde_json::from_str(&op.json).unwrap();
+        value["v"] = json!(1);
+        let downgraded = Op::parse(&value.to_string()).unwrap();
+        assert!(matches!(downgraded.action, Action::Invalid(_)));
+
+        // A broken file reference is rejected in any version.
+        let mut value: Value = serde_json::from_str(&op.json).unwrap();
+        value["payload"]["input_ref"] = json!("sha256:kort:1:x");
+        assert!(matches!(
+            Op::parse(&value.to_string()).unwrap().action,
+            Action::Invalid(_)
+        ));
+        value["payload"]["input_ref"] = json!("../../etc/passwd");
+        assert!(matches!(
+            Op::parse(&value.to_string()).unwrap().action,
+            Action::Invalid(_)
         ));
     }
 }
