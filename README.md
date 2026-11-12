@@ -1,6 +1,20 @@
 # SimQ
 
-En liten skrivbordsapp som håller ordning på lagets simuleringsförfrågor: vilka simuleringar som behövs, vem som gör dem, och var indata, rapport och resultat finns.
+[![Release](https://github.com/Olsn-Dev/simq/actions/workflows/release.yml/badge.svg)](https://github.com/Olsn-Dev/simq/actions/workflows/release.yml)
+
+**Kön för lagets simuleringsförfrågor.** En liten skrivbordsapp för Formula Student-lag som håller ordning på vilka simuleringar som behövs, vem som gör dem, och var indata, rapport och resultat finns.
+
+*A small desktop app that tracks a Formula Student team's simulation requests: what is needed, who is doing it, and where the input, report and results are. Available in Swedish and English. No server needed.*
+
+![SimQ med kön till vänster och ett ärende öppet till höger](docs/screenshot.jpg)
+
+- **Ingen server.** Laget synkar via ett privat GitHub-repo eller en delad mapp.
+- **Fungerar utan nät.** Ändringar skickas när nätet är tillbaka.
+- **Inga krockar.** Tar två personer samma ärende samtidigt får alla samma vinnare.
+- **Svenska och engelska.** Varje person väljer själv.
+- **En enda fil** för Windows, macOS och Linux. Ingenting installeras.
+
+**Innehåll:** [Så fungerar det](#så-fungerar-det) · [Kom igång med GitHub](#kom-igång-med-github) · [Delad mapp](#kom-igång-med-en-delad-mapp-alternativ) · [Ladda ner](#ladda-ner-och-starta) · [Bra att veta](#bra-att-veta) · [För utvecklare](#för-utvecklare)
 
 SimQ kör inga simuleringar. Själva jobbet gör du som vanligt i Ansys, SolidWorks, Fusion eller vad du nu använder. SimQ är bara kön och anslagstavlan.
 

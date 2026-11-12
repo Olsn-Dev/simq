@@ -27,7 +27,7 @@ jobs:
           - os: ubuntu-latest
             name: linux-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -92,7 +92,7 @@ jobs:
           tar -czf "simq-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C dist simq
 
       - name: Bifoga till GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             simq-*.zip
