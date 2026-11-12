@@ -1,12 +1,12 @@
-//! Lokal SQLite-cache.
+//! Local SQLite cache.
 //!
-//! Cachen är helt härledd från filerna i den delade mappen och kan raderas
-//! när som helst. Tabeller:
-//! - `ops`        – alla inlästa händelser (filens text)
-//! - `seen_files` – vilka filer som redan lästs, och hur det gick
-//! - `requests`   – härledda ärenden
-//! - `op_result`  – om varje händelse tillämpades eller avvisades, och varför
-//! - `meta`       – vilken mapp cachen hör till
+//! The cache is derived entirely from the files in the shared folder and can be
+//! deleted at any time. Tables:
+//! - `ops`        – all events read so far (the file's text)
+//! - `seen_files` – which files have already been read, and how it went
+//! - `requests`   – derived requests
+//! - `op_result`  – whether each event was applied or rejected, and why
+//! - `meta`       – which folder the cache belongs to
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -83,13 +83,13 @@ pub enum StoreError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeenState {
-    /// Inläst (eller en dubblett av en redan inläst händelse).
+    /// Read (or a duplicate of an event already read).
     Ok,
-    /// Gick inte att tolka ännu, försök igen vid nästa runda.
+    /// Could not be parsed yet, try again next round.
     Retry,
-    /// Gick inte att tolka efter max antal försök.
+    /// Could not be parsed after the maximum number of attempts.
     Corrupt,
-    /// Komplett men ogiltig fil.
+    /// Complete but invalid file.
     Invalid,
 }
 
@@ -132,14 +132,14 @@ impl Seen {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IngestReport {
-    /// Antal nya händelser.
+    /// Number of new events.
     pub added: usize,
-    /// Antal händelser som redan fanns (samma op_id).
+    /// Number of events that already existed (same op_id).
     pub duplicates: usize,
-    /// Sant om en ny händelse sorterades före redan tillämpade, så att hela
-    /// loggen spelades upp från början.
+    /// True if a new event sorted before already applied ones, so that the whole
+    /// log was replayed from the start.
     pub full_replay: bool,
-    /// Händelser som tidigare var tillämpade men nu är avvisade.
+    /// Events that were applied before but are now rejected.
     pub flipped: Vec<Uuid>,
 }
 
@@ -159,8 +159,8 @@ impl Store {
         Self::init(Connection::open(path)?)
     }
 
-    /// Öppnar cachen. Går den inte att öppna (t.ex. skadad fil) kastas den
-    /// och byggs om från den delade mappen.
+    /// Opens the cache. If it cannot be opened (e.g. a damaged file) it is discarded
+    /// and rebuilt from the shared folder.
     pub fn open_or_recreate(path: &Path) -> Result<Store, StoreError> {
         match Self::open(path) {
             Ok(store) => Ok(store),
@@ -202,7 +202,7 @@ impl Store {
         Ok(store)
     }
 
-    /// Läser in händelserna från cachen och spelar upp dem från början.
+    /// Loads the events from the cache and replays them from the start.
     pub fn reload(&mut self) -> Result<(), StoreError> {
         self.ops.clear();
         self.ids.clear();
@@ -254,7 +254,7 @@ impl Store {
         &self.state
     }
 
-    /// Alla händelser i den totala ordningen.
+    /// All events in the total order.
     pub fn ops(&self) -> &[Arc<Op>] {
         &self.ops
     }
@@ -263,9 +263,9 @@ impl Store {
         &self.seen
     }
 
-    /// Tar emot nya händelser (i godtycklig ordning). Dubbletter ignoreras.
-    /// Sorteras alla nya sist tillämpas de inkrementellt, annars spelas hela
-    /// loggen upp från början i en transaktion.
+    /// Takes in new events (in any order). Duplicates are ignored.
+    /// If all new ones sort last they are applied incrementally, otherwise the whole
+    /// log is replayed from the start in one transaction.
     pub fn ingest(&mut self, incoming: Vec<Op>) -> Result<IngestReport, StoreError> {
         let mut report = IngestReport::default();
         let mut fresh: Vec<Arc<Op>> = Vec::new();
@@ -284,7 +284,7 @@ impl Store {
         match self.ingest_sorted(&fresh, &mut report) {
             Ok(()) => Ok(report),
             Err(e) => {
-                // Minnet och databasen kan ha hamnat i otakt: läs om från databasen.
+                // Memory and database may be out of step: reload from the database.
                 let _ = self.reload();
                 Err(e)
             }
@@ -363,7 +363,7 @@ impl Store {
         Ok(())
     }
 
-    /// Sparar hur det gick att läsa ett antal filer.
+    /// Stores how reading a number of files went.
     pub fn mark_seen(&mut self, updates: Vec<(String, Seen)>) -> Result<(), StoreError> {
         if updates.is_empty() {
             return Ok(());
@@ -389,7 +389,7 @@ impl Store {
         Ok(())
     }
 
-    /// Tömmer cachen helt. Nästa synk läser om allt från mappen.
+    /// Empties the cache completely. The next sync reads everything from the folder again.
     pub fn clear(&mut self) -> Result<(), StoreError> {
         self.conn.execute_batch(
             "BEGIN;
@@ -424,8 +424,8 @@ impl Store {
         Ok(())
     }
 
-    /// De härledda tabellerna som text, i fast ordning. Används för att
-    /// jämföra två cachar med varandra.
+    /// The derived tables as text, in a fixed order. Used to
+    /// compare two caches with each other.
     pub fn derived_dump(&self) -> Result<Vec<String>, StoreError> {
         let mut out = Vec::new();
         for (table, key) in [("requests", "request_id"), ("op_result", "op_id")] {
@@ -528,7 +528,7 @@ fn write_request(conn: &Connection, r: &Request) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Ersätter de härledda tabellerna med resultatet av en full uppspelning.
+/// Replaces the derived tables with the result of a full replay.
 fn write_derived_full(conn: &Connection, state: &State) -> Result<(), StoreError> {
     conn.execute_batch("DELETE FROM requests; DELETE FROM op_result;")?;
     for request in state.requests.values() {
@@ -548,8 +548,8 @@ mod tests {
     use crate::replay::Reject;
     use crate::testutil::{create_action, finish_action, op_at, take_action, Rng, TempDir};
 
-    /// En blandad uppsättning händelser: flera ärenden, konkurrerande take,
-    /// ogiltiga övergångar, händelser utan create och okända sorter.
+    /// A mixed set of events: several requests, competing takes,
+    /// invalid transitions, events without a create and unknown kinds.
     fn scenario() -> Vec<Op> {
         let clients: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
         let names = ["Anna", "Bo", "Cia", "Dan"];
@@ -568,7 +568,7 @@ mod tests {
                 id,
                 &create_action(&format!("Ärende {i}")),
             ));
-            // Två som tar samtidigt, ibland på exakt samma millisekund.
+            // Two taking at the same time, sometimes in exactly the same millisecond.
             let same_ms = i % 3 == 0;
             ops.push(op_at(c(1), t + 500, 0, n(1), id, &take_action(n(1))));
             ops.push(op_at(
@@ -609,12 +609,12 @@ mod tests {
                     ops.push(op_at(c(1), t + 601, 0, n(1), id, &finish_action(n(1))));
                 }
                 _ => {
-                    // Take med tidigare stämpel än create (klocka som går fel).
+                    // Take with an earlier stamp than the create (a clock that is off).
                     ops.push(op_at(c(3), t - 400, 0, n(3), id, &take_action(n(3))));
                 }
             }
         }
-        // Händelse för ett ärende som aldrig skapas.
+        // Event for a request that is never created.
         ops.push(op_at(
             clients[0],
             t + 5000,
@@ -623,7 +623,7 @@ mod tests {
             Uuid::new_v4(),
             &take_action("Anna"),
         ));
-        // Okänd sort från en nyare app.
+        // Unknown kind from a newer app.
         let template = op_at(
             clients[1],
             t + 6000,
@@ -656,14 +656,14 @@ mod tests {
         for round in 0..120 {
             let mut shuffled = ops.clone();
             rng.shuffle(&mut shuffled);
-            // Lägg till några dubbletter på slumpade platser.
+            // Add a few duplicates in random places.
             for _ in 0..5 {
                 let dup = shuffled[rng.below(shuffled.len())].clone();
                 let at = rng.below(shuffled.len());
                 shuffled.insert(at, dup);
             }
             let mut store = Store::open_in_memory().unwrap();
-            // Varierande klumpstorlek: en i taget, små klumpar eller allt på en gång.
+            // Varying batch size: one at a time, small batches or everything at once.
             let chunk = match round % 3 {
                 0 => 1,
                 1 => 1 + rng.below(7),
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(store.state().requests[&id].assignee, "Bo");
         assert_eq!(store.state().outcomes[&take_bo.op_id], Outcome::Applied);
 
-        // Cias take skapades tidigare men kommer fram senare via Drive.
+        // Cia's take was created earlier but arrives later via Drive.
         let report = store.ingest(vec![take_cia.clone()]).unwrap();
         assert!(report.full_replay);
         assert_eq!(report.flipped, vec![take_bo.op_id]);
@@ -714,7 +714,7 @@ mod tests {
             }
         ));
 
-        // Avvisningen och anledningen sparas i op_result.
+        // The rejection and its reason are stored in op_result.
         let dump = store.derived_dump().unwrap();
         assert!(dump.iter().any(|line| line.starts_with("op_result")
             && line.contains(&take_bo.op_id.to_string())
@@ -787,7 +787,7 @@ mod tests {
         assert!(store.derived_dump().unwrap().is_empty());
         drop(store);
 
-        // En skadad cachefil kastas och ersätts.
+        // A damaged cache file is discarded and replaced.
         std::fs::write(&path, b"detta ar inte en databas").unwrap();
         let store = Store::open_or_recreate(&path).unwrap();
         assert!(store.ops().is_empty());
@@ -810,7 +810,7 @@ mod tests {
                 ops.push(op_at(clients[i % 8], t, 0, "Bo", id, &action));
             }
         }
-        // En händelse som sorteras allra först tvingar fram full uppspelning.
+        // An event that sorts first of all forces a full replay.
         let early = ops.remove(0);
         let mut store = Store::open_in_memory().unwrap();
         store.ingest(ops).unwrap();
@@ -824,7 +824,7 @@ mod tests {
         assert_eq!(store.state().requests.len(), 2_500);
         assert!(
             elapsed < std::time::Duration::from_secs(1),
-            "full uppspelning tog {elapsed:?}"
+            "full replay took {elapsed:?}"
         );
     }
 }

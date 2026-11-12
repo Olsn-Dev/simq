@@ -1,8 +1,8 @@
-//! Synk mot den delade mappen.
+//! Sync with the shared folder.
 //!
-//! `Client` innehåller all logik (läsa mappen, skicka in egna händelser) och
-//! är fri från trådar så att den kan testas. `spawn` startar bakgrundstråden
-//! som äger klienten, så att gränssnittet aldrig gör fil-I/O.
+//! `Client` contains all the logic (reading the folder, submitting own events) and
+//! is free of threads so that it can be tested. `spawn` starts the background thread
+//! that owns the client, so that the user interface never does file I/O.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,9 +21,9 @@ use crate::ops::{self, FolderError, NewAction, Op, ReadError};
 use crate::replay::{Outcome, State};
 use crate::store::{Seen, SeenState, Store, StoreError};
 
-/// Så många gånger försöker vi läsa en fil som inte går att tolka.
+/// How many times we try to read a file that cannot be parsed.
 pub const MAX_ATTEMPTS: u32 = 20;
-/// Mappen läses med det här intervallet.
+/// The folder is read at this interval.
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(15);
 const FOCUS_SYNC_MIN_GAP: Duration = Duration::from_secs(3);
 const META_FOLDER: &str = "folder";
@@ -38,17 +38,17 @@ pub fn now_ms() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FolderStatus {
     NotConfigured,
-    /// Första synken har inte körts än.
+    /// The first sync has not run yet.
     Starting,
     Ok,
-    /// Mappen saknas (t.ex. Drive avmonterad): läsning från cachen fungerar.
+    /// The folder is missing (e.g. Drive unmounted): reading from the cache works.
     Missing,
-    /// Mappen kräver en nyare app: inget får skrivas.
+    /// The folder requires a newer app: nothing may be written.
     NewerFormat,
     Error(String),
 }
 
-/// Ett meddelande som ska visas som dialog.
+/// A message to show as a dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub title: String,
@@ -59,7 +59,7 @@ pub struct Notice {
 pub struct SyncReport {
     pub new_ops: usize,
     pub full_replay: bool,
-    /// Egna händelser som tidigare gällde men nu är avvisade.
+    /// Own events that applied before but are now rejected.
     pub conflicts: Vec<Notice>,
 }
 
@@ -69,7 +69,7 @@ pub enum Submitted {
         request_id: Uuid,
         op_id: Uuid,
     },
-    /// Någon hann före: inget skrevs.
+    /// Someone got there first: nothing was written.
     Rejected(Notice),
 }
 
@@ -78,7 +78,7 @@ pub struct HistoryEntry {
     pub at_ms: u64,
     pub by: String,
     pub what: String,
-    /// `None` om händelsen tillämpades, annars varför den inte gäller.
+    /// `None` if the event was applied, otherwise why it does not apply.
     pub problem: Option<String>,
 }
 
@@ -99,7 +99,7 @@ pub struct DiagFile {
     pub error: String,
 }
 
-/// Allt gränssnittet behöver, som en oföränderlig ögonblicksbild.
+/// Everything the user interface needs, as an immutable snapshot.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub requests: Vec<Request>,
@@ -113,7 +113,7 @@ pub struct Snapshot {
     pub rejected_ops: Vec<DiagOp>,
     pub folder: Option<PathBuf>,
     pub client_id: Uuid,
-    /// Läget mot GitHub, om appen synkar mot ett repo.
+    /// The status towards GitHub, if the app syncs with a repository.
     pub remote: Option<RemoteStatus>,
 }
 
@@ -182,7 +182,7 @@ impl Client {
         &self.status
     }
 
-    /// Byter visningsnamn och/eller mapp. Byts mappen töms cachen.
+    /// Changes display name and/or folder. If the folder changes the cache is emptied.
     pub fn set_identity(
         &mut self,
         display_name: String,
@@ -199,8 +199,8 @@ impl Client {
         Ok(())
     }
 
-    /// Läser mappen: listar `ops/**/*.json`, läser bara filer som inte redan
-    /// är avklarade i `seen_files`, och spelar upp de nya händelserna.
+    /// Reads the folder: lists `ops/**/*.json`, reads only files that are not already
+    /// finished in `seen_files`, and replays the new events.
     pub fn sync(&mut self) -> SyncReport {
         let mut report = SyncReport::default();
         let Some(folder) = self.folder.clone() else {
@@ -222,7 +222,7 @@ impl Client {
         let scan = match ops::scan_ops(&folder) {
             Ok(scan) => scan,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Nyare format utan ops-mapp, eller så försvann mappen just nu.
+                // Newer format without an ops folder, or the folder disappeared just now.
                 self.status = if status == FolderStatus::NewerFormat {
                     status
                 } else {
@@ -327,8 +327,8 @@ impl Client {
         report
     }
 
-    /// Skickar in en egen händelse: skriver filen och spelar samtidigt upp
-    /// den lokalt, så att gränssnittet svarar direkt.
+    /// Submits an own event: writes the file and replays it locally at the same
+    /// time, so that the user interface responds immediately.
     pub fn submit(
         &mut self,
         request_id: Option<Uuid>,
@@ -363,7 +363,7 @@ impl Client {
             ));
         }
 
-        // Skriv inget som vi redan vet inte kommer att gälla.
+        // Do not write anything we already know will not apply.
         match self.store.state().preview(&op) {
             Outcome::Applied => {}
             Outcome::Waiting => {
@@ -386,7 +386,7 @@ impl Client {
             )
         })?;
         let op_id = op.op_id;
-        // Filen är skriven. Ett cachefel här löser sig vid nästa synk.
+        // The file is written. A cache error here resolves itself at the next sync.
         self.store.ingest(vec![op]).map_err(|e| e.to_string())?;
         self.store
             .mark_seen(vec![(rel, Seen::ok())])
@@ -394,7 +394,7 @@ impl Client {
         Ok(Submitted::Applied { request_id, op_id })
     }
 
-    /// "Anna tog ärendet före dig, så din ändring gäller inte. Ärendet är Pågår (Anna)."
+    /// "Anna took the request before you, so your change does not apply. The request is in progress (Anna)."
     fn conflict_notice(&self, op: &Op, outcome: &Outcome) -> Notice {
         let request = self.store.state().requests.get(&op.request_id);
         let mut text = match outcome {
@@ -446,8 +446,8 @@ impl Client {
         Notice { title, text }
     }
 
-    /// Tömmer cachen och läser om allt från mappen. Görs bara när mappen
-    /// går att nå, annars skulle den sparade datan försvinna.
+    /// Empties the cache and reads everything from the folder again. Only done when
+    /// the folder is reachable, otherwise the saved data would disappear.
     pub fn rebuild(&mut self) -> Result<SyncReport, String> {
         let folder = self.folder.clone().ok_or_else(|| {
             t("Ingen delad mapp är vald.", "No shared folder is selected.").to_string()
@@ -468,8 +468,8 @@ impl Client {
         Ok(self.sync())
     }
 
-    /// Tolkar om de sparade händelserna så att felmeddelanden som skapades
-    /// vid inläsningen får det nya språket.
+    /// Re-parses the stored events so that error messages created
+    /// while reading get the new language.
     pub fn retranslate(&mut self) {
         let _ = self.store.reload();
     }
@@ -565,7 +565,7 @@ impl Client {
     }
 }
 
-/// En cache hör ihop med en viss mapp. Pekas en annan mapp ut töms cachen.
+/// A cache belongs to one particular folder. If another folder is chosen the cache is emptied.
 fn bind_cache(store: &mut Store, folder: &Path) -> Result<(), StoreError> {
     let wanted = folder.to_string_lossy().into_owned();
     if store.meta_get(META_FOLDER)?.as_deref() != Some(wanted.as_str()) {
@@ -576,13 +576,13 @@ fn bind_cache(store: &mut Store, folder: &Path) -> Result<(), StoreError> {
 }
 
 // ---------------------------------------------------------------------------
-// Bakgrundstråden
+// The background thread
 // ---------------------------------------------------------------------------
 
 pub enum Cmd {
-    /// Knappen "Synka nu".
+    /// The "Sync now" button.
     SyncNow,
-    /// Fönstret fick fokus (hoppas över om vi nyss synkade).
+    /// The window got focus (skipped if we just synced).
     FocusSync,
     Submit {
         token: u64,
@@ -594,24 +594,24 @@ pub enum Cmd {
         display_name: String,
         source: Source,
     },
-    /// Rapport från tråden som speglar mot GitHub.
+    /// Report from the thread that mirrors against GitHub.
     Remote {
         status: RemoteStatus,
         new_files: bool,
     },
     Rebuild,
-    /// Byter språk: sparas i inställningarna och alla texter byggs om.
+    /// Changes language: saved in the settings and all texts are rebuilt.
     SetLanguage(Lang),
     Shutdown,
 }
 
-/// Var händelserna ska synkas.
+/// Where the events should be synced.
 pub enum Source {
-    /// En delad mapp, t.ex. i Google Drive för skrivbord.
+    /// A shared folder, e.g. in Google Drive for desktop.
     Folder(PathBuf),
-    /// Ett privat GitHub-repo: `ägare/repo:token`.
+    /// A private GitHub repository: `owner/repo:token`.
     TeamKey(String),
-    /// Behåll det som redan är inställt (bara namnet ändras).
+    /// Keep what is already configured (only the name changes).
     Keep,
 }
 
@@ -649,8 +649,8 @@ impl Drop for Handle {
     }
 }
 
-/// Startar bakgrundstråden. `notify` anropas varje gång det finns något nytt
-/// att visa (gränssnittet använder den för att rita om).
+/// Starts the background thread. `notify` is called every time there is something
+/// new to show (the user interface uses it to repaint).
 pub fn spawn(
     client: Client,
     config: Config,
@@ -707,7 +707,7 @@ impl Worker {
                     self.sync();
                 }
                 Ok(Cmd::Remote { status, new_files }) => {
-                    // Rapporter från en transport som bytts ut ignoreras.
+                    // Reports from a transport that has been replaced are ignored.
                     let current = self.config.github.as_ref().map(|g| g.repo.as_str());
                     if current == Some(status.repo.as_str()) {
                         self.client.set_remote(Some(status));
@@ -797,7 +797,7 @@ impl Worker {
         }
     }
 
-    /// Startar (om) tråden som speglar mot GitHub, om ett repo är inställt.
+    /// (Re)starts the thread that mirrors against GitHub, if a repository is configured.
     fn start_transport(&mut self) {
         self.transport = None;
         let Some(github) = self.config.github.clone() else {
@@ -847,7 +847,7 @@ impl Worker {
         let folder = match source {
             Source::Folder(folder) => {
                 match ops::ensure_layout(&folder) {
-                    // En mapp med nyare format får väljas, men då går det bara att läsa.
+                    // A folder with a newer format may be chosen, but then it can only be read.
                     Ok(()) | Err(FolderError::NewerFormat(_)) => {}
                     Err(FolderError::NotFound) => return Err(t(
                         "Mappen finns inte. Välj en mapp som finns på datorn.",
@@ -862,7 +862,7 @@ impl Worker {
             }
             Source::TeamKey(key) => {
                 let (repo, token) = github::parse_team_key(&key)?;
-                // Kontrollera mot GitHub att nyckeln når repot och får skriva.
+                // Check with GitHub that the key can reach the repository and may write.
                 let branch = GithubRemote::check(&repo, &token).map_err(|e| e.text())?;
                 let folder = self.paths.mirror_folder(&repo);
                 std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
@@ -919,7 +919,7 @@ mod tests {
     fn applied(result: Result<Submitted, String>) -> Uuid {
         match result {
             Ok(Submitted::Applied { request_id, .. }) => request_id,
-            other => panic!("väntade en tillämpad händelse, fick {other:?}"),
+            other => panic!("expected an applied event, got {other:?}"),
         }
     }
 
@@ -932,7 +932,7 @@ mod tests {
             .collect()
     }
 
-    /// Simulerar att Drive levererar filer: kopierar allt som saknas.
+    /// Simulates Drive delivering files: copies everything that is missing.
     fn deliver(from: &Path, to: &Path) {
         for entry in ops::scan_ops(from).unwrap().entries {
             let dir = to.join(OPS_DIR).join(&entry.dir);
@@ -953,7 +953,7 @@ mod tests {
         assert_eq!(*a.status(), FolderStatus::Ok);
         assert!(shared.path().join("format.json").is_file());
 
-        // Skapa i A, synka B.
+        // Create in A, sync B.
         let id = applied(a.submit(None, &create_action("Styvhet upright")));
         assert_eq!(a.state().requests[&id].status, Status::Queued);
         assert_eq!(b.sync().new_ops, 1);
@@ -962,13 +962,13 @@ mod tests {
         assert_eq!(seen_by_b.requester, "Anna");
         assert_eq!(seen_by_b.last_by, "Anna");
 
-        // B tar ärendet, synka A.
+        // B takes the request, sync A.
         applied(b.submit(Some(id), &take_action("Bo")));
         assert_eq!(a.sync().new_ops, 1);
         assert_eq!(a.state().requests[&id].status, Status::Running);
         assert_eq!(a.state().requests[&id].assignee, "Bo");
 
-        // B avslutar med Drive-länk som rapport och Vault-beskrivning som resultat.
+        // B finishes with a Drive link as report and a Vault description as results.
         applied(b.submit(Some(id), &finish_action("Bo")));
         let report = a.sync();
         assert_eq!(report.new_ops, 1);
@@ -979,11 +979,11 @@ mod tests {
         assert_eq!(done.results.as_ref().unwrap().kind, LocKind::Vault);
         assert_eq!(a.state(), b.state());
 
-        // Filerna ligger i ops/YYYY-MM/ och inga .part-filer är kvar.
+        // The files are in ops/YYYY-MM/ and no .part files are left.
         assert_eq!(op_files(shared.path()).len(), 3);
         assert!(ops::scan_ops(shared.path()).unwrap().ignored.is_empty());
 
-        // En synk utan nyheter läser inga filer igen.
+        // A sync without news does not read any files again.
         assert_eq!(a.sync().new_ops, 0);
         assert_eq!(a.store().seen().len(), 3);
     }
@@ -998,7 +998,7 @@ mod tests {
         applied(b.submit(Some(id), &take_action("Bo")));
         a.sync();
 
-        // Anna klickar "Ta ärendet" i en vy som hunnit bli gammal.
+        // Anna clicks "Take request" in a view that has become stale.
         match a.submit(Some(id), &take_action("Anna")) {
             Ok(Submitted::Rejected(notice)) => {
                 assert_eq!(
@@ -1006,11 +1006,11 @@ mod tests {
                     "Bo tog ärendet före dig, så din ändring gäller inte. Ärendet är Pågår (Bo)."
                 );
             }
-            other => panic!("oväntat: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
         assert_eq!(op_files(shared.path()).len(), 2);
 
-        // Ogiltig indata stoppas innan något skrivs.
+        // Invalid input is stopped before anything is written.
         let bad = NewAction::Finish {
             assignee: "Anna".to_string(),
             report: Some(Location {
@@ -1026,7 +1026,7 @@ mod tests {
 
     #[test]
     fn drive_delay_both_take_and_both_end_up_with_the_same_winner() {
-        // Två datorer med var sin lokala kopia av mappen. "Drive" är `deliver`.
+        // Two computers, each with its own local copy of the folder. "Drive" is `deliver`.
         let (dir_a, dir_b) = (TempDir::new(), TempDir::new());
         let mut a = client(dir_a.path(), "Anna");
         let mut b = client(dir_b.path(), "Bo");
@@ -1036,24 +1036,24 @@ mod tests {
         b.sync();
         assert_eq!(b.state().requests[&id].status, Status::Queued);
 
-        // Båda tar ärendet innan Drive hunnit synka.
+        // Both take the request before Drive has synced.
         applied(a.submit(Some(id), &take_action("Anna")));
         applied(b.submit(Some(id), &take_action("Bo")));
         assert_eq!(a.state().requests[&id].assignee, "Anna");
         assert_eq!(b.state().requests[&id].assignee, "Bo");
 
-        // Drive levererar åt båda håll.
+        // Drive delivers in both directions.
         deliver(dir_a.path(), dir_b.path());
         deliver(dir_b.path(), dir_a.path());
         let report_a = a.sync();
         let report_b = b.sync();
 
-        // Båda visar samma vinnare.
+        // Both show the same winner.
         assert_eq!(a.state(), b.state());
         let winner = a.state().requests[&id].assignee.clone();
         assert_eq!(a.state().requests[&id].status, Status::Running);
 
-        // Exakt en förlorare, och det är hen som får dialogen.
+        // Exactly one loser, and that is who gets the dialog.
         let (loser_report, winner_report, loser, other) = if winner == "Anna" {
             (&report_b, &report_a, "Bo", "Anna")
         } else {
@@ -1069,7 +1069,7 @@ mod tests {
             )
         );
 
-        // Historiken visar båda försöken, varav ett avvisat.
+        // The history shows both attempts, one of them rejected.
         let snapshot = a.snapshot();
         let history = &snapshot.history[&id];
         assert_eq!(history.len(), 3);
@@ -1077,7 +1077,7 @@ mod tests {
         assert_eq!(snapshot.rejected_ops.len(), 1);
         assert_eq!(snapshot.rejected_ops[0].by, loser);
 
-        // Dialogen visas bara en gång.
+        // The dialog is only shown once.
         assert!(a.sync().conflicts.is_empty());
         assert!(b.sync().conflicts.is_empty());
     }
@@ -1102,7 +1102,7 @@ mod tests {
                         "Bo took the request before you, so your change does not apply. The request is in progress (Bo)."
                     );
                 }
-                other => panic!("oväntat: {other:?}"),
+                other => panic!("unexpected: {other:?}"),
             }
             let snapshot = a.snapshot();
             let history = &snapshot.history[&id];
@@ -1127,7 +1127,7 @@ mod tests {
             );
         });
 
-        // Samma klient på svenska igen: inget språk har sparats i datan.
+        // The same client in Swedish again: no language has been stored in the data.
         assert_eq!(a.snapshot().history[&id][1].what, "Tog ärendet");
         assert_eq!(
             FolderError::NewerFormat(3).to_string(),
@@ -1141,11 +1141,11 @@ mod tests {
         let mut a = client(shared.path(), "Anna");
         let id = applied(a.submit(None, &create_action("Upright")));
         let created_at = a.state().requests[&id].created_at;
-        // Annas take ska få en senare millisekund än create.
+        // Anna's take must get a later millisecond than the create.
         std::thread::sleep(Duration::from_millis(5));
         applied(a.submit(Some(id), &take_action("Anna")));
 
-        // En take från Cia med tidigare stämpel dyker upp i mappen i efterhand.
+        // A take from Cia with an earlier stamp shows up in the folder afterwards.
         let late = op_at(
             Uuid::new_v4(),
             created_at,
@@ -1173,7 +1173,7 @@ mod tests {
         let id = applied(a.submit(None, &create_action("Upright")));
         b.sync();
 
-        // B:s take syns först bara som .part och sedan som avklippt JSON.
+        // B's take is first only visible as .part and then as truncated JSON.
         let take = op_at(
             b.client_id(),
             now_ms() + 10,
@@ -1206,7 +1206,7 @@ mod tests {
         assert_eq!(a.state().requests[&id].status, Status::Queued);
         assert_eq!(*a.status(), FolderStatus::Ok);
 
-        // Drive blir klar med filen.
+        // Drive finishes the file.
         fs::write(month.join(&name), take.json.as_bytes()).unwrap();
         assert_eq!(a.sync().new_ops, 1);
         assert_eq!(a.store().seen()[&rel].state, SeenState::Ok);
@@ -1236,7 +1236,7 @@ mod tests {
         let name = ops::file_name(&ghost);
         let rel = format!("{}/{name}", ops::month_dir(ghost.hlc.wall_ms));
         fs::write(month.join(&name), b"{ \"v\": 1, \"op_id\": ").unwrap();
-        // En fil med fel namn direkt i ops/ ignoreras bara.
+        // A file with the wrong name directly in ops/ is simply ignored.
         fs::write(shared.path().join(OPS_DIR).join("trasig.json"), b"{{{").unwrap();
 
         for _ in 0..MAX_ATTEMPTS - 1 {
@@ -1246,7 +1246,7 @@ mod tests {
         a.sync();
         assert_eq!(a.store().seen()[&rel].state, SeenState::Corrupt);
         assert_eq!(a.store().seen()[&rel].attempts, MAX_ATTEMPTS);
-        // Därefter läses filen inte fler gånger.
+        // After that the file is not read any more.
         a.sync();
         assert_eq!(a.store().seen()[&rel].attempts, MAX_ATTEMPTS);
 
@@ -1287,7 +1287,7 @@ mod tests {
                 note: "Behövs inte längre".to_string(),
             },
         ));
-        // En avvisad händelse ska också byggas om likadant.
+        // A rejected event must also be rebuilt the same way.
         let late = op_at(
             Uuid::new_v4(),
             now_ms() + 50,
@@ -1303,7 +1303,7 @@ mod tests {
         assert_eq!(a.store().ops().len(), 6);
         drop(a);
 
-        // Radera cachefilen helt.
+        // Delete the cache file completely.
         for suffix in ["", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", cache.display()));
         }
@@ -1313,12 +1313,12 @@ mod tests {
         assert_eq!(*a.state(), state_before);
         assert_eq!(a.store().derived_dump().unwrap(), dump_before);
 
-        // Samma sak med knappen "Bygg om cachen".
+        // The same with the "Rebuild cache" button.
         a.rebuild().unwrap();
         assert_eq!(*a.state(), state_before);
         assert_eq!(a.store().derived_dump().unwrap(), dump_before);
 
-        // Och efter omstart utan synk läses allt från cachen.
+        // And after a restart without a sync everything is read from the cache.
         drop(a);
         let a = open(&cache);
         assert_eq!(*a.state(), state_before);
@@ -1333,7 +1333,7 @@ mod tests {
         let id = applied(a.submit(None, &create_action("Upright")));
         a.sync();
 
-        // Drive avmonteras.
+        // Drive is unmounted.
         let away = parent.path().join("borta");
         fs::rename(&folder, &away).unwrap();
         a.sync();
@@ -1343,9 +1343,12 @@ mod tests {
         assert!(a.submit(Some(id), &take_action("Anna")).is_err());
         assert!(a.rebuild().is_err());
         assert_eq!(a.state().requests[&id].status, Status::Queued);
-        assert!(!folder.exists(), "inget får skapas när mappen saknas");
+        assert!(
+            !folder.exists(),
+            "nothing may be created when the folder is missing"
+        );
 
-        // Drive kommer tillbaka.
+        // Drive comes back.
         fs::rename(&away, &folder).unwrap();
         a.sync();
         assert_eq!(*a.status(), FolderStatus::Ok);
@@ -1379,19 +1382,19 @@ mod tests {
         let mut a = client(shared.path(), "Anna");
         let id = applied(a.submit(None, &create_action("Upright")));
 
-        // Bo:s klocka går en timme före.
+        // Bo's clock is one hour ahead.
         let ahead = now_ms() + 3_600_000;
         let take = op_at(Uuid::new_v4(), ahead, 0, "Bo", id, &take_action("Bo"));
         ops::write_op(shared.path(), &take).unwrap();
         a.sync();
         assert_eq!(a.state().requests[&id].status, Status::Running);
 
-        // Annas nästa händelse hamnar ändå EFTER Bo:s och gäller därför.
+        // Anna's next event still ends up AFTER Bo's and therefore applies.
         applied(a.submit(Some(id), &finish_action("Anna")));
         assert_eq!(a.state().requests[&id].status, Status::Done);
         assert!(a.state().requests[&id].finished_at.unwrap() >= ahead);
 
-        // En händelse en vecka in i framtiden spelas upp men flyttar inte klockan.
+        // An event one week into the future is replayed but does not move the clock.
         let other = applied(a.submit(None, &create_action("Aero")));
         let far = now_ms() + 7 * 24 * 3_600_000;
         let far_take = op_at(Uuid::new_v4(), far, 0, "Dan", other, &take_action("Dan"));
@@ -1419,11 +1422,11 @@ mod tests {
                     break result.map(|_| ())
                 }
                 Ok(_) => {}
-                Err(e) => panic!("inget svar från bakgrundstråden: {e}"),
+                Err(e) => panic!("no reply from the background thread: {e}"),
             }
         };
 
-        // Utan mapp går inget att spara.
+        // Without a folder nothing can be saved.
         handle.send(Cmd::Submit {
             token: 1,
             request_id: None,
@@ -1455,10 +1458,7 @@ mod tests {
                 assert_eq!(snapshot.requests[0].last_by, "Åsa");
                 break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "ögonblicksbilden uppdaterades inte"
-            );
+            assert!(Instant::now() < deadline, "the snapshot was not updated");
             std::thread::sleep(Duration::from_millis(20));
         }
     }

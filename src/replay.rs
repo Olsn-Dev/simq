@@ -1,9 +1,9 @@
-//! Den deterministiska statusmaskinen.
+//! The deterministic state machine.
 //!
-//! Händelserna spelas upp i den totala ordningen (wall_ms, counter, client_id,
-//! op_id). Varje händelse blir tillämpad eller avvisad beroende på ärendets
-//! status just då. Resultatet beror bara på MÄNGDEN händelser, aldrig på i
-//! vilken ordning filerna råkade komma fram.
+//! The events are replayed in the total order (wall_ms, counter, client_id,
+//! op_id). Every event is applied or rejected depending on the request's
+//! status at that point. The result depends only on the SET of events, never on
+//! the order in which the files happened to arrive.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,11 +17,11 @@ use crate::ops::{Action, Op};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {
-    /// create för ett request_id som redan finns.
+    /// create for a request_id that already exists.
     AlreadyExists,
-    /// Övergången är inte tillåten från den status ärendet hade.
+    /// The transition is not allowed from the status the request had.
     WrongStatus(Status),
-    /// Händelsens innehåll är ogiltigt.
+    /// The content of the event is invalid.
     Invalid(String),
 }
 
@@ -43,7 +43,7 @@ impl Reject {
     }
 }
 
-/// Den händelse som gjorde att en senare händelse avvisades.
+/// The event that caused a later event to be rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocker {
     pub by: String,
@@ -57,9 +57,9 @@ pub enum Outcome {
         reason: Reject,
         blocker: Option<Blocker>,
     },
-    /// Ärendets create har inte kommit fram än.
+    /// The request's create has not arrived yet.
     Waiting,
-    /// Okänd sort eller nyare version: sparad men utan effekt.
+    /// Unknown kind or newer version: stored but without effect.
     Ignored,
 }
 
@@ -68,13 +68,13 @@ pub struct State {
     pub requests: HashMap<Uuid, Request>,
     pub outcomes: HashMap<Uuid, Outcome>,
     waiting: HashMap<Uuid, Vec<Arc<Op>>>,
-    /// Sant om någon händelse kräver en nyare app.
+    /// True if any event requires a newer app.
     pub unsupported_seen: bool,
     next_seq: u32,
 }
 
 impl State {
-    /// Spelar upp hela loggen från början. `ops` måste vara sorterad.
+    /// Replays the whole log from the start. `ops` must be sorted.
     pub fn replay_all(ops: &[Arc<Op>]) -> State {
         let mut state = State::default();
         for op in ops {
@@ -83,8 +83,8 @@ impl State {
         state
     }
 
-    /// Tillämpar nästa händelse i ordningen. Returnerar id för de händelser
-    /// vars utfall sattes (händelsen själv, plus sådana som väntat på create).
+    /// Applies the next event in the order. Returns the ids of the events
+    /// whose outcome was set (the event itself, plus any that waited for create).
     pub fn apply(&mut self, op: &Arc<Op>) -> Vec<Uuid> {
         if self.outcomes.contains_key(&op.op_id) {
             return Vec::new(); // dubblett
@@ -143,7 +143,7 @@ impl State {
                     };
                     self.requests.insert(op.request_id, request);
                     self.outcomes.insert(op.op_id, Outcome::Applied);
-                    // Händelser som kom före sin create tillämpas nu, i ordning.
+                    // Events that arrived before their create are applied now, in order.
                     if let Some(waiting) = self.waiting.remove(&op.request_id) {
                         for earlier in waiting {
                             self.apply_to_existing(&earlier);
@@ -174,7 +174,7 @@ impl State {
         }
     }
 
-    /// Vad skulle hända om `op` tillämpades nu? Ändrar ingenting.
+    /// What would happen if `op` were applied now? Changes nothing.
     pub fn preview(&self, op: &Op) -> Outcome {
         match &op.action {
             Action::Unsupported => Outcome::Ignored,
@@ -200,7 +200,7 @@ impl State {
     }
 }
 
-/// Statusmaskinen för ett befintligt ärende.
+/// The state machine for an existing request.
 fn transition(request: &mut Request, op: &Op) -> Outcome {
     let status = request.status;
     let at = op.hlc.wall_ms;
@@ -334,13 +334,13 @@ mod tests {
         let high = Uuid::parse_str("ffffffff-0000-4000-8000-000000000001").unwrap();
         let create = op_at(creator, 1000, 0, "Anna", id, &create_action("Upright"));
 
-        // Samma millisekund och räknare: lägst client_id vinner.
+        // Same millisecond and counter: the lowest client_id wins.
         let t_low = op_at(low, 2000, 0, "Låg", id, &take_action("Låg"));
         let t_high = op_at(high, 2000, 0, "Hög", id, &take_action("Hög"));
         let state = replay(vec![create.clone(), t_high, t_low]);
         assert_eq!(state.requests[&id].assignee, "Låg");
 
-        // Lägre räknare går före oavsett client_id.
+        // A lower counter goes first regardless of client_id.
         let t_low = op_at(low, 2000, 1, "Låg", id, &take_action("Låg"));
         let t_high = op_at(high, 2000, 0, "Hög", id, &take_action("Hög"));
         let state = replay(vec![create, t_low, t_high]);
@@ -417,7 +417,7 @@ mod tests {
             }
         ));
 
-        // Köa om nollställde utförare, tider och anteckning innan finish från köad.
+        // Requeue reset assignee, times and note before the finish from queued.
         let request = &state.requests[&id];
         assert_eq!(request.status, Status::Done);
         assert_eq!(request.assignee, "C");
@@ -487,21 +487,21 @@ mod tests {
         let create = Arc::new(op_at(a, 1000, 0, "Anna", id, &create_action("Upright")));
         let take = Arc::new(op_at(b, 2000, 0, "Bo", id, &take_action("Bo")));
 
-        // Bara take har kommit fram.
+        // Only the take has arrived.
         let mut state = State::default();
         state.apply(&take);
         assert!(state.requests.is_empty());
         assert_eq!(state.outcomes[&take.op_id], Outcome::Waiting);
 
-        // När create dyker upp spelas loggen upp i rätt ordning.
+        // When the create shows up the log is replayed in the right order.
         let mut ops = vec![Arc::clone(&take), Arc::clone(&create)];
         sort_ops(&mut ops);
         let state = State::replay_all(&ops);
         assert_eq!(state.requests[&id].status, Status::Running);
         assert_eq!(state.outcomes[&take.op_id], Outcome::Applied);
 
-        // Även om take har en TIDIGARE stämpel än create (klockor som går fel)
-        // tillämpas den så fort create hittats.
+        // Even if the take has an EARLIER stamp than the create (clocks that are off)
+        // it is applied as soon as the create has been found.
         let early_take = Arc::new(op_at(b, 500, 0, "Bo", id, &take_action("Bo")));
         let mut state = State::default();
         assert_eq!(state.apply(&early_take), vec![early_take.op_id]);
@@ -559,7 +559,7 @@ mod tests {
             ));
         }
 
-        // Resultatplats är valfri.
+        // The results location is optional.
         let ok = op_at(
             a,
             5,
@@ -630,7 +630,7 @@ mod tests {
         assert_eq!(state.outcomes.len(), 10_000);
         assert!(
             elapsed < std::time::Duration::from_secs(1),
-            "uppspelningen tog {elapsed:?}"
+            "the replay took {elapsed:?}"
         );
     }
 }

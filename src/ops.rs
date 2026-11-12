@@ -1,8 +1,8 @@
-//! Händelseformatet och filerna i den delade mappen.
+//! The event format and the files in the shared folder.
 //!
-//! Allt som läses från mappen är otrustad indata: storleken begränsas,
-//! JSON tolkas strikt och alla fält valideras innan de används.
-//! Befintliga filer skrivs aldrig över och raderas aldrig.
+//! Everything read from the folder is untrusted input: the size is limited,
+//! JSON is parsed strictly and all fields are validated before they are used.
+//! Existing files are never overwritten and never deleted.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -19,17 +19,17 @@ use crate::model::{
     MAX_TITLE,
 };
 
-/// Största tillåtna storlek för en händelsefil.
+/// Largest allowed size of an event file.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
-/// Högsta händelseversion som den här appen förstår.
+/// Highest event version this app understands.
 pub const SUPPORTED_V: u32 = 1;
-/// Högsta mappformat som den här appen får skriva till.
+/// Highest folder format this app may write to.
 pub const FORMAT_VERSION: u32 = 1;
 
 pub const OPS_DIR: &str = "ops";
 pub const FORMAT_FILE: &str = "format.json";
 
-/// Sorteringsnyckel för den totala ordningen.
+/// Sort key for the total order.
 pub type OpKey = (u64, u32, Uuid, Uuid);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub struct FinishPayload {
     pub summary: String,
 }
 
-/// Den tolkade och validerade effekten av en händelse.
+/// The parsed and validated effect of an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Create(Box<CreatePayload>),
@@ -66,13 +66,13 @@ pub enum Action {
         note: String,
     },
     Requeue,
-    /// Okänd `kind` eller högre `v` än appen känner till: sparas men har ingen effekt.
+    /// Unknown `kind` or a higher `v` than the app knows: stored but has no effect.
     Unsupported,
-    /// Känd `kind` men ogiltigt innehåll: avvisas vid uppspelning med den här anledningen.
+    /// Known `kind` but invalid content: rejected at replay with this reason.
     Invalid(String),
 }
 
-/// En händelse så som den ligger i en fil.
+/// An event as it is stored in a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Op {
     pub v: u32,
@@ -83,16 +83,16 @@ pub struct Op {
     pub kind: String,
     pub request_id: Uuid,
     pub action: Action,
-    /// Filens text, sparas oförändrad i cachen.
+    /// The file's text, stored unchanged in the cache.
     pub json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReadError {
-    /// Filen kan vara halvsynkad. Försök igen vid nästa runda.
+    /// The file may be half-synced. Try again next round.
     #[error("{0}")]
     Incomplete(String),
-    /// Filen är komplett men ogiltig. Den ignoreras permanent.
+    /// The file is complete but invalid. It is ignored permanently.
     #[error("{0}")]
     Invalid(String),
 }
@@ -110,7 +110,7 @@ struct WireOp {
     payload: Value,
 }
 
-/// Händelser från nyare appversioner: bara det som behövs för ordning och dedupering.
+/// Events from newer app versions: only what is needed for ordering and deduplication.
 #[derive(Deserialize)]
 struct LenientOp {
     op_id: Uuid,
@@ -266,7 +266,7 @@ fn parse_action(kind: &str, payload: Value) -> Action {
 }
 
 impl Op {
-    /// Tolkar innehållet i en händelsefil.
+    /// Parses the content of an event file.
     pub fn parse(text: &str) -> Result<Op, ReadError> {
         let value: Value =
             serde_json::from_str(text).map_err(|e| ReadError::Incomplete(e.to_string()))?;
@@ -319,7 +319,7 @@ impl Op {
         })
     }
 
-    /// Total ordning för uppspelning: (wall_ms, counter, client_id, op_id).
+    /// Total order for replay: (wall_ms, counter, client_id, op_id).
     pub fn key(&self) -> OpKey {
         (
             self.hlc.wall_ms,
@@ -338,7 +338,7 @@ impl Op {
     }
 }
 
-/// En åtgärd som användaren vill göra, innan den blivit en händelse.
+/// An action the user wants to perform, before it has become an event.
 #[derive(Debug, Clone)]
 pub enum NewAction {
     Create {
@@ -434,8 +434,8 @@ impl NewAction {
     }
 }
 
-/// Bygger en ny händelse. Den går genom exakt samma tolkning och validering
-/// som främmande filer, så det som skrivs kan alltid läsas tillbaka.
+/// Builds a new event. It goes through exactly the same parsing and validation
+/// as foreign files, so what is written can always be read back.
 pub fn build_op(
     client_id: Uuid,
     hlc: Hlc,
@@ -461,10 +461,10 @@ pub fn build_op(
 }
 
 // ---------------------------------------------------------------------------
-// Filnamn
+// File names
 // ---------------------------------------------------------------------------
 
-/// `{wall_ms:013}-{counter:04}_{client_id_första_8}_{op_id}.json`
+/// `{wall_ms:013}-{counter:04}_{first_8_of_client_id}_{op_id}.json`
 pub fn file_name(op: &Op) -> String {
     let client = op.client_id.to_string();
     format!(
@@ -484,8 +484,8 @@ pub struct ParsedName {
     pub op_id: Uuid,
 }
 
-/// Accepterar bara namn som matchar mönstret exakt. Allt annat (.DS_Store,
-/// desktop.ini, *.part, "namn (1).json" …) ger `None`.
+/// Only accepts names that match the pattern exactly. Anything else (.DS_Store,
+/// desktop.ini, *.part, "name (1).json" …) gives `None`.
 pub fn parse_file_name(name: &str) -> Option<ParsedName> {
     let stem = name.strip_suffix(".json")?;
     if stem.len() != 13 + 1 + 4 + 1 + 8 + 1 + 36 || !stem.is_ascii() {
@@ -519,7 +519,7 @@ pub fn parse_file_name(name: &str) -> Option<ParsedName> {
     })
 }
 
-/// Undermapp `YYYY-MM` (UTC) för en händelse.
+/// Subfolder `YYYY-MM` (UTC) for an event.
 pub fn month_dir(wall_ms: u64) -> String {
     i64::try_from(wall_ms)
         .ok()
@@ -529,7 +529,7 @@ pub fn month_dir(wall_ms: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Mappens struktur
+// Folder layout
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -562,8 +562,8 @@ struct FormatFile {
     format_version: u32,
 }
 
-/// Kontrollerar mappen och skapar `ops/` och `format.json` om de saknas.
-/// Ger `NewerFormat` om mappen kräver en nyare app (då får inget skrivas).
+/// Checks the folder and creates `ops/` and `format.json` if they are missing.
+/// Gives `NewerFormat` if the folder requires a newer app (then nothing may be written).
 pub fn ensure_layout(folder: &Path) -> Result<(), FolderError> {
     if !folder.is_dir() {
         return Err(FolderError::NotFound);
@@ -601,8 +601,8 @@ fn read_limited(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Skriver en NY fil: först `<namn>.part`, flush + fsync, sedan namnbyte.
-/// En befintlig fil skrivs aldrig över.
+/// Writes a NEW file: first `<name>.part`, flush + fsync, then rename.
+/// An existing file is never overwritten.
 pub(crate) fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if path.exists() {
         return Err(std::io::Error::new(
@@ -622,14 +622,14 @@ pub(crate) fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         fs::rename(&part, path)
     })();
     if result.is_err() {
-        // Städa bara upp vår egen temporära fil.
+        // Only clean up our own temporary file.
         let _ = fs::remove_file(&part);
     }
     result
 }
 
-/// Skriver en händelse till `<mapp>/ops/YYYY-MM/<filnamn>.json`.
-/// Returnerar den relativa sökvägen under `ops/`.
+/// Writes an event to `<folder>/ops/YYYY-MM/<file name>.json`.
+/// Returns the relative path below `ops/`.
 pub fn write_op(folder: &Path, op: &Op) -> std::io::Result<String> {
     let month = month_dir(op.hlc.wall_ms);
     let name = file_name(op);
@@ -640,12 +640,12 @@ pub fn write_op(folder: &Path, op: &Op) -> std::io::Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Läsning
+// Reading
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanEntry {
-    /// Relativ sökväg under `ops/`, t.ex. `2026-11/<filnamn>.json`.
+    /// Relative path below `ops/`, e.g. `2026-11/<file name>.json`.
     pub rel: String,
     pub dir: String,
     pub name: String,
@@ -655,13 +655,13 @@ pub struct ScanEntry {
 #[derive(Debug, Default)]
 pub struct Scan {
     pub entries: Vec<ScanEntry>,
-    /// Filer som inte matchar namnmönstret (relativa sökvägar).
+    /// Files that do not match the name pattern (relative paths).
     pub ignored: Vec<String>,
     pub errors: Vec<String>,
 }
 
-/// Listar `ops/**/*.json`. Bara filer i en månadsmapp med ett namn som
-/// matchar mönstret tas med, allt annat hamnar i `ignored`.
+/// Lists `ops/**/*.json`. Only files in a month folder with a name that
+/// matches the pattern are included, everything else ends up in `ignored`.
 pub fn scan_ops(folder: &Path) -> std::io::Result<Scan> {
     let root = folder.join(OPS_DIR);
     let mut scan = Scan::default();
@@ -713,8 +713,8 @@ pub fn scan_ops(folder: &Path) -> std::io::Result<Scan> {
     Ok(scan)
 }
 
-/// Läser och validerar en händelsefil. Filnamn och månadsmapp måste stämma
-/// med innehållet, så att en händelse bara kan finnas på en enda plats.
+/// Reads and validates an event file. File name and month folder must agree
+/// with the content, so that an event can only exist in one single place.
 pub fn read_op_file(entry: &ScanEntry) -> Result<Op, ReadError> {
     let meta = fs::metadata(&entry.path).map_err(|e| ReadError::Incomplete(e.to_string()))?;
     if meta.len() > MAX_FILE_BYTES {
@@ -783,10 +783,10 @@ mod tests {
             Uuid::new_v4(),
             &create_action("Styvhet bakre upright"),
         )
-        .expect("giltig händelse")
+        .expect("valid event")
     }
 
-    /// Lägger en fil med givet innehåll på den plats där `op` skulle ligga.
+    /// Puts a file with the given content where `op` would be stored.
     fn plant(folder: &Path, op: &Op, content: &[u8]) -> ScanEntry {
         let dir = month_dir(op.hlc.wall_ms);
         let name = file_name(op);
@@ -807,7 +807,7 @@ mod tests {
         let op = sample_op();
         let name = file_name(&op);
         assert!(name.starts_with("1794000000000-0003_"));
-        let parsed = parse_file_name(&name).expect("namnet ska matcha mönstret");
+        let parsed = parse_file_name(&name).expect("the name should match the pattern");
         assert_eq!(parsed.wall_ms, op.hlc.wall_ms);
         assert_eq!(parsed.counter, 3);
         assert_eq!(parsed.op_id, op.op_id);
@@ -834,7 +834,7 @@ mod tests {
             "åäö.json".to_string(),
         ];
         for name in &bad {
-            assert!(parse_file_name(name).is_none(), "{name} ska ignoreras");
+            assert!(parse_file_name(name).is_none(), "{name} should be ignored");
         }
         assert!(parse_file_name(&good).is_some());
     }
@@ -854,7 +854,7 @@ mod tests {
         assert_eq!(read, op);
         assert_eq!(read.by, "Åsa Öberg");
 
-        // Ingen .part-fil ligger kvar och samma händelse kan inte skrivas två gånger.
+        // No .part file is left behind and the same event cannot be written twice.
         assert!(write_op(tmp.path(), &op).is_err());
         assert_eq!(scan_ops(tmp.path()).unwrap().entries.len(), 1);
     }
@@ -887,12 +887,12 @@ mod tests {
         ensure_layout(tmp.path()).unwrap();
         let op = sample_op();
 
-        // För stor fil.
+        // File too large.
         let big = vec![b' '; MAX_FILE_BYTES as usize + 1];
         let entry = plant(tmp.path(), &op, &big);
         assert!(matches!(read_op_file(&entry), Err(ReadError::Invalid(_))));
 
-        // Trasig eller avklippt JSON: försök igen senare.
+        // Broken or truncated JSON: try again later.
         for content in [
             &b"{\"v\": 1, \"op_id\": \"abc"[..],
             b"",
@@ -908,7 +908,7 @@ mod tests {
             );
         }
 
-        // Giltig JSON men okänt schema.
+        // Valid JSON but unknown schema.
         for content in [
             "[]",
             "null",
@@ -927,18 +927,18 @@ mod tests {
             );
         }
 
-        // Extra fält i en v1-händelse avvisas (strikt tolkning).
+        // Extra fields in a v1 event are rejected (strict parsing).
         let mut value: Value = serde_json::from_str(&op.json).unwrap();
         value["extra"] = json!(true);
         let entry = plant(tmp.path(), &op, value.to_string().as_bytes());
         assert!(matches!(read_op_file(&entry), Err(ReadError::Invalid(_))));
 
-        // Innehållet tillhör en annan händelse än filnamnet säger.
+        // The content belongs to a different event than the file name says.
         let other = sample_op();
         let entry = plant(tmp.path(), &op, other.json.as_bytes());
         assert!(matches!(read_op_file(&entry), Err(ReadError::Invalid(_))));
 
-        // Rätt namn men fel månadsmapp.
+        // Right name but wrong month folder.
         let wrong_dir = tmp.path().join(OPS_DIR).join("1999-01");
         fs::create_dir_all(&wrong_dir).unwrap();
         let name = file_name(&op);
@@ -951,7 +951,7 @@ mod tests {
         };
         assert!(matches!(read_op_file(&entry), Err(ReadError::Invalid(_))));
 
-        // Den riktiga filen går fortfarande att läsa.
+        // The real file can still be read.
         let entry = plant(tmp.path(), &op, op.json.as_bytes());
         assert_eq!(read_op_file(&entry).unwrap(), op);
     }
@@ -960,7 +960,7 @@ mod tests {
         let mut value: Value = serde_json::from_str(&op.json).unwrap();
         value["kind"] = json!(kind);
         value["payload"] = payload;
-        Op::parse(&value.to_string()).expect("kuvertet är giltigt")
+        Op::parse(&value.to_string()).expect("the envelope is valid")
     }
 
     #[test]
@@ -991,7 +991,7 @@ mod tests {
         );
         assert!(matches!(bad_input.action, Action::Invalid(_)));
 
-        // Samma text som fri text under "Annat" är tillåten, men blir aldrig en länk.
+        // The same text as free text under "Other" is allowed, but never becomes a link.
         let as_text = with_payload(
             &op,
             "finish",
@@ -1009,10 +1009,10 @@ mod tests {
                 assert_eq!(p.report.kind, LocKind::Other);
                 assert!(!crate::model::is_http_url(&p.report.value));
             }
-            other => panic!("oväntat: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
 
-        // Det egna gränssnittet kan inte heller skapa en sådan händelse.
+        // The app's own interface cannot create such an event either.
         let own = build_op(
             Uuid::new_v4(),
             hlc(1, 0),
@@ -1069,7 +1069,7 @@ mod tests {
             Action::Invalid(_)
         ));
 
-        // Okända fält i payload, fel typer och saknade fält.
+        // Unknown fields in the payload, wrong types and missing fields.
         assert!(matches!(
             with_payload(&op, "take", json!({"assignee": "Bo", "x": 1})).action,
             Action::Invalid(_)
@@ -1129,7 +1129,7 @@ mod tests {
         assert!(tmp.path().join(OPS_DIR).is_dir());
         let text = fs::read_to_string(tmp.path().join(FORMAT_FILE)).unwrap();
         assert_eq!(text, "{\"format_version\":1}");
-        // Andra gången ändras ingenting.
+        // The second time nothing changes.
         ensure_layout(tmp.path()).unwrap();
 
         let newer = TempDir::new();

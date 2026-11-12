@@ -1,8 +1,8 @@
-//! Språkval: svenska eller engelska.
+//! Language choice: Swedish or English.
 //!
-//! Språket är en global inställning som både gränssnittet och bakgrundstråden
-//! läser. Inget språkberoende sparas i den delade mappen: händelsefilerna
-//! innehåller bara data, så lagmedlemmar kan använda olika språk.
+//! The language is a global setting read by both the user interface and the
+//! background thread. Nothing language-dependent is stored in the shared folder:
+//! the event files contain only data, so team members can use different languages.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Lang {
-    /// Engelska.
+    /// English.
     En,
-    /// Svenska (även för okända värden i konfigurationsfilen).
+    /// Swedish (also for unknown values in the configuration file).
     #[default]
     #[serde(other)]
     Sv,
@@ -22,7 +22,7 @@ pub enum Lang {
 impl Lang {
     pub const ALL: [Lang; 2] = [Lang::Sv, Lang::En];
 
-    /// Språkets eget namn, visas likadant oavsett valt språk.
+    /// The language's own name, shown the same regardless of the selected language.
     pub fn name(self) -> &'static str {
         match self {
             Lang::Sv => "Svenska",
@@ -38,7 +38,7 @@ thread_local! {
     static OVERRIDE: std::cell::Cell<Option<Lang>> = const { std::cell::Cell::new(None) };
 }
 
-/// Byter språk för hela appen.
+/// Changes the language for the whole app.
 pub fn set(lang: Lang) {
     CURRENT.store(u8::from(lang == Lang::En), Ordering::Relaxed);
 }
@@ -59,7 +59,7 @@ pub fn is_en() -> bool {
     lang() == Lang::En
 }
 
-/// Väljer text efter aktuellt språk.
+/// Picks the text for the current language.
 pub fn t(sv: &'static str, en: &'static str) -> &'static str {
     match lang() {
         Lang::Sv => sv,
@@ -67,7 +67,7 @@ pub fn t(sv: &'static str, en: &'static str) -> &'static str {
     }
 }
 
-/// Kör `f` med ett visst språk i den här testtråden, utan att störa andra tester.
+/// Runs `f` with a given language in this test thread, without disturbing other tests.
 #[cfg(test)]
 pub fn with_lang<R>(lang: Lang, f: impl FnOnce() -> R) -> R {
     OVERRIDE.with(|o| o.set(Some(lang)));
@@ -92,7 +92,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&Lang::En).unwrap(), "\"en\"");
         assert_eq!(serde_json::from_str::<Lang>("\"sv\"").unwrap(), Lang::Sv);
         assert_eq!(serde_json::from_str::<Lang>("\"en\"").unwrap(), Lang::En);
-        // Okända språk ger svenska i stället för att hela konfigurationen kastas.
+        // Unknown languages give Swedish instead of the whole configuration being discarded.
         assert_eq!(serde_json::from_str::<Lang>("\"de\"").unwrap(), Lang::Sv);
     }
 }

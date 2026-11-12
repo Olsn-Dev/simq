@@ -1,12 +1,12 @@
-//! Synk mot ett privat GitHub-repo med en delad teamnyckel.
+//! Sync with a private GitHub repository using a shared team key.
 //!
-//! Appen arbetar som vanligt mot en lokal mapp (en spegel som appen äger).
-//! Den här modulen håller spegeln och repot lika: nya filer i repot laddas
-//! ner, nya lokala filer laddas upp. Eftersom varje händelse är en egen fil
-//! som aldrig ändras kan det aldrig bli konflikter i innehållet.
+//! The app works against a local folder as usual (a mirror that the app owns).
+//! This module keeps the mirror and the repository equal: new files in the
+//! repository are downloaded, new local files are uploaded. Since every event
+//! is its own file that never changes, the content can never conflict.
 //!
-//! Allt som kommer från repot är otrustad indata: bara sökvägar på formen
-//! `ops/YYYY-MM/<giltigt filnamn>` tas emot, och storleken begränsas.
+//! Everything coming from the repository is untrusted input: only paths of the
+//! form `ops/YYYY-MM/<valid file name>` are accepted, and the size is limited.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -22,19 +22,19 @@ use crate::i18n::t;
 use crate::ops::{self, FORMAT_FILE, FORMAT_VERSION, MAX_FILE_BYTES, OPS_DIR};
 
 const API_BASE: &str = "https://api.github.com";
-/// Så ofta frågar vi GitHub om det finns något nytt.
+/// How often we ask GitHub whether there is anything new.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const UPLOAD_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubConfig {
-    /// `ägare/repo`
+    /// `owner/repo`
     pub repo: String,
     pub token: String,
     pub branch: String,
 }
 
-/// Teamnyckeln är `ägare/repo:token` (ett inledande `simq:` är tillåtet).
+/// The team key is `owner/repo:token` (a leading `simq:` is allowed).
 pub fn parse_team_key(key: &str) -> Result<(String, String), String> {
     let bad = || {
         t(
@@ -67,15 +67,15 @@ pub fn parse_team_key(key: &str) -> Result<(String, String), String> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteError {
-    /// Ingen kontakt (inget nät, tidsgräns).
+    /// No contact (no network, timeout).
     Offline(String),
-    /// Nyckeln godtas inte eller saknar rättigheter.
+    /// The key is not accepted or lacks permissions.
     Denied,
-    /// Repot finns inte, eller nyckeln når det inte.
+    /// The repository does not exist, or the key cannot reach it.
     NotFound,
-    /// Någon annan skrev samtidigt. Försök igen.
+    /// Someone else wrote at the same time. Try again.
     Conflict,
-    /// Filen finns redan.
+    /// The file already exists.
     Exists,
     Other(String),
 }
@@ -117,7 +117,7 @@ pub struct RemoteFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Listing {
-    /// Inget har ändrats sedan förra listningen.
+    /// Nothing has changed since the previous listing.
     Unchanged,
     Files {
         etag: Option<String>,
@@ -125,16 +125,16 @@ pub enum Listing {
     },
 }
 
-/// Det som behövs av en fjärrlagring. GitHub i drift, en låtsaslagring i tester.
+/// What is needed from a remote store. GitHub in production, a fake store in tests.
 pub trait RemoteStore: Send {
     fn list(&mut self, etag: Option<&str>) -> Result<Listing, RemoteError>;
     fn download(&mut self, path: &str) -> Result<Vec<u8>, RemoteError>;
-    /// Skapar en NY fil. `Exists` om den redan finns.
+    /// Creates a NEW file. `Exists` if it is already there.
     fn upload(&mut self, path: &str, bytes: &[u8]) -> Result<(), RemoteError>;
 }
 
 // ---------------------------------------------------------------------------
-// GitHubs REST-API
+// The GitHub REST API
 // ---------------------------------------------------------------------------
 
 pub struct GithubRemote {
@@ -206,7 +206,7 @@ fn classify(error: ureq::Error) -> RemoteError {
     }
 }
 
-/// Procentkodar allt utom ofarliga tecken (grennamn kan innehålla t.ex. `/`).
+/// Percent-encodes everything except safe characters (branch names may contain e.g. `/`).
 fn encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
@@ -245,7 +245,7 @@ pub fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Bara sökvägar som appen själv skapar får skickas till API:t.
+/// Only paths the app creates itself may be sent to the API.
 fn safe_path(path: &str) -> bool {
     !path.is_empty()
         && !path.contains("..")
@@ -270,8 +270,8 @@ impl GithubRemote {
         }
     }
 
-    /// Kontrollerar att nyckeln når repot och får skriva. Returnerar repots
-    /// standardgren.
+    /// Checks that the key can reach the repository and may write. Returns the
+    /// repository's default branch.
     pub fn check(repo: &str, token: &str) -> Result<String, RemoteError> {
         Self::check_at(API_BASE, repo, token)
     }
@@ -328,7 +328,7 @@ impl RemoteStore for GithubRemote {
         }
         let response = match request.call() {
             Ok(response) => response,
-            // Ett helt tomt repo har inget träd än.
+            // A completely empty repository has no tree yet.
             Err(ureq::Error::Status(409, _)) => {
                 return Ok(Listing::Files {
                     etag: None,
@@ -370,7 +370,9 @@ impl RemoteStore for GithubRemote {
 
     fn download(&mut self, path: &str) -> Result<Vec<u8>, RemoteError> {
         if !safe_path(path) {
-            return Err(RemoteError::Other("ogiltig sökväg".to_string()));
+            return Err(RemoteError::Other(
+                t("ogiltig sökväg", "invalid path").to_string(),
+            ));
         }
         let url = format!(
             "{}/repos/{}/contents/{}?ref={}",
@@ -395,7 +397,9 @@ impl RemoteStore for GithubRemote {
 
     fn upload(&mut self, path: &str, bytes: &[u8]) -> Result<(), RemoteError> {
         if !safe_path(path) {
-            return Err(RemoteError::Other("ogiltig sökväg".to_string()));
+            return Err(RemoteError::Other(
+                t("ogiltig sökväg", "invalid path").to_string(),
+            ));
         }
         let url = format!("{}/repos/{}/contents/{}", self.base, self.repo, path);
         let name = path.rsplit('/').next().unwrap_or(path);
@@ -413,18 +417,18 @@ impl RemoteStore for GithubRemote {
 }
 
 // ---------------------------------------------------------------------------
-// Spegling
+// Mirroring
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
 pub struct MirrorState {
     etag: Option<String>,
-    /// Sökvägar som vi vet finns i repot.
+    /// Paths we know exist in the repository.
     known: HashSet<String>,
-    /// Sant när vi listat repot minst en gång (först då vet vi vad som saknas där).
+    /// True once we have listed the repository at least once (only then do we know what is missing there).
     listed: bool,
     format_sha: Option<String>,
-    /// Repot kräver en nyare app: då laddar vi inte upp något.
+    /// The repository requires a newer app: then we upload nothing.
     remote_newer: bool,
 }
 
@@ -432,7 +436,7 @@ pub struct MirrorState {
 pub struct MirrorReport {
     pub downloaded: usize,
     pub uploaded: usize,
-    /// Lokala händelser som ännu inte finns i repot.
+    /// Local events that are not yet in the repository.
     pub pending: usize,
     pub error: Option<RemoteError>,
 }
@@ -442,7 +446,7 @@ struct FormatProbe {
     format_version: u32,
 }
 
-/// `ops/YYYY-MM/<giltigt filnamn>` → (månadsmapp, filnamn). Allt annat ger `None`.
+/// `ops/YYYY-MM/<valid file name>` → (month folder, file name). Anything else gives `None`.
 fn op_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("ops/")?;
     let (dir, name) = rest.split_once('/')?;
@@ -486,7 +490,7 @@ fn upload_with_retry(
     Err(last)
 }
 
-/// En runda: hämta det som är nytt i repot, skicka det som är nytt lokalt.
+/// One round: fetch what is new in the repository, send what is new locally.
 pub fn mirror_once(
     remote: &mut dyn RemoteStore,
     folder: &Path,
@@ -513,8 +517,8 @@ pub fn mirror_once(
                                     .unwrap_or(0);
                                 state.remote_newer = version > FORMAT_VERSION;
                                 if state.remote_newer {
-                                    // Spegeln är appens egen: låt den visa att repot
-                                    // kräver en nyare app, så att inget skrivs.
+                                    // The mirror is the app's own: let it show that the repository
+                                    // requires a newer app, so that nothing is written.
                                     let _ = std::fs::write(folder.join(FORMAT_FILE), &bytes);
                                 }
                             }
@@ -554,7 +558,7 @@ pub fn mirror_once(
                     }
                 }
             }
-            // Blev vi avbrutna frågar vi om hela listan nästa gång.
+            // If we were interrupted, ask for the whole list again next time.
             state.etag = if complete { etag } else { None };
         }
         Err(e) => report.error = Some(e),
@@ -602,14 +606,14 @@ pub fn mirror_once(
 }
 
 // ---------------------------------------------------------------------------
-// Bakgrundstråd
+// Background thread
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteState {
     Starting,
     Ok,
-    /// Ingen kontakt: appen fungerar, ändringar skickas när nätet är tillbaka.
+    /// No contact: the app works, changes are sent when the network is back.
     Offline,
     Error(String),
 }
@@ -618,7 +622,7 @@ pub enum RemoteState {
 pub struct RemoteStatus {
     pub repo: String,
     pub state: RemoteState,
-    /// Lokala ändringar som väntar på att skickas.
+    /// Local changes waiting to be sent.
     pub pending: usize,
     pub last_ok_ms: Option<u64>,
 }
@@ -634,14 +638,14 @@ impl RemoteStatus {
     }
 }
 
-/// Handtag till transporttråden. Tråden stannar när handtaget släpps.
+/// Handle to the transport thread. The thread stops when the handle is dropped.
 pub struct Transport {
     wake: Sender<()>,
     stop: Arc<AtomicBool>,
 }
 
 impl Transport {
-    /// Kör en runda nu i stället för att vänta på nästa intervall.
+    /// Run a round now instead of waiting for the next interval.
     pub fn wake(&self) {
         let _ = self.wake.send(());
     }
@@ -654,8 +658,8 @@ impl Drop for Transport {
     }
 }
 
-/// Startar tråden som speglar `folder` mot `remote`. `report` anropas efter
-/// varje runda med läget och om nya filer laddades ner.
+/// Starts the thread that mirrors `folder` against `remote`. `report` is called
+/// after every round with the status and whether new files were downloaded.
 pub fn spawn_transport(
     mut remote: Box<dyn RemoteStore>,
     repo: String,
@@ -696,7 +700,7 @@ pub fn spawn_transport(
                     Ok(()) | Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
-                // Flera väckningar i rad räcker med en runda.
+                // Several wake-ups in a row only need one round.
                 while wake_rx.try_recv().is_ok() {}
             }
         })?;
@@ -716,7 +720,7 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
-    // ----- Låtsaslagring i minnet ------------------------------------------
+    // ----- In-memory fake store ---------------------------------------------
 
     #[derive(Default)]
     struct Repo {
@@ -792,7 +796,7 @@ mod tests {
         }
     }
 
-    /// En lagmedlem: klient + egen spegelmapp + egen transport mot samma repo.
+    /// A team member: client + own mirror folder + own transport to the same repository.
     struct Member {
         dir: TempDir,
         client: Client,
@@ -820,7 +824,7 @@ mod tests {
             member
         }
 
-        /// En runda mot repot följd av att appen läser sin mapp.
+        /// One round against the repository followed by the app reading its folder.
         fn round(&mut self) -> MirrorReport {
             let report = mirror_once(&mut self.remote, self.dir.path(), &mut self.state);
             self.client.sync();
@@ -830,7 +834,7 @@ mod tests {
         fn submit(&mut self, id: Option<Uuid>, action: &crate::ops::NewAction) -> Uuid {
             match self.client.submit(id, action) {
                 Ok(Submitted::Applied { request_id, .. }) => request_id,
-                other => panic!("oväntat: {other:?}"),
+                other => panic!("unexpected: {other:?}"),
             }
         }
     }
@@ -861,7 +865,7 @@ mod tests {
         assert_eq!(a.client.state().requests[&id].assignee, "Bo");
         assert_eq!(a.client.state(), b.client.state());
 
-        // Inget nytt: inga nedladdningar och inga uppladdningar.
+        // Nothing new: no downloads and no uploads.
         let downloads = remote.repo().downloads;
         assert_eq!(a.round(), MirrorReport::default());
         assert_eq!(b.round(), MirrorReport::default());
@@ -878,7 +882,7 @@ mod tests {
         a.round();
         b.round();
 
-        // Nätet försvinner. Båda tar ärendet ändå.
+        // The network goes away. Both take the request anyway.
         remote.repo().offline = true;
         a.submit(Some(id), &take_action("Anna"));
         b.submit(Some(id), &take_action("Bo"));
@@ -889,7 +893,7 @@ mod tests {
         assert_eq!(a.client.state().requests[&id].assignee, "Anna");
         assert_eq!(b.round().pending, 1);
 
-        // Nätet kommer tillbaka: allt skickas och båda får samma vinnare.
+        // The network comes back: everything is sent and both get the same winner.
         remote.repo().offline = false;
         assert_eq!(a.round().uploaded, 1);
         let report = b.round();
@@ -957,7 +961,7 @@ mod tests {
         ] {
             remote.put(&path, b"{\"v\": 1}");
         }
-        // Giltigt namn men för stor fil, och giltigt namn med skräp i.
+        // Valid name but too large a file, and valid name with junk inside.
         let big = name.replace(&name[..13], "1794000000002");
         remote.put(
             &format!("ops/2026-11/{big}"),
@@ -969,14 +973,11 @@ mod tests {
         let mut b = Member::new("Bo", &remote);
         let report = b.round();
         assert_eq!(report.error, None);
-        assert_eq!(
-            report.downloaded, 2,
-            "bara den riktiga filen och skräpfilen"
-        );
+        assert_eq!(report.downloaded, 2, "only the real file and the junk file");
         assert_eq!(b.client.state().requests[&id].title, "Upright");
         assert_eq!(b.client.state().requests.len(), 1);
 
-        // Ingenting hamnade utanför ops/, och skräpfilen väntar bara på nya försök.
+        // Nothing ended up outside ops/, and the junk file is just waiting for retries.
         let mut top: Vec<String> = std::fs::read_dir(b.dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1001,7 +1002,7 @@ mod tests {
         a.round();
         a.submit(None, &create_action("Upright"));
 
-        // Någon med en nyare app har uppgraderat repot.
+        // Someone with a newer app has upgraded the repository.
         remote.put("format.json", b"{\"format_version\": 9}");
         let before = remote.repo().files.len();
         let report = a.round();
@@ -1053,10 +1054,10 @@ mod tests {
         assert!(op_path("ops/2026-11/x.json").is_none());
     }
 
-    // ----- Låtsas-GitHub över HTTP ------------------------------------------
+    // ----- Fake GitHub over HTTP --------------------------------------------
     //
-    // Kontrollerar att anropen ser ut som GitHubs REST-API förväntar sig
-    // (adresser, rubriker, base64) och att svaren tolkas rätt.
+    // Checks that the requests look the way the GitHub REST API expects
+    // (URLs, headers, base64) and that the responses are parsed correctly.
 
     const TOKEN: &str = "github_pat_TESTNYCKEL123";
 
@@ -1249,7 +1250,7 @@ mod tests {
     fn github_api_calls() {
         let (base, server) = start_server();
 
-        // Kontroll av nyckeln.
+        // Checking the key.
         assert_eq!(
             GithubRemote::check_at(&base, "lag/simq", TOKEN),
             Ok("main".to_string())
@@ -1269,7 +1270,7 @@ mod tests {
         ));
         server.lock().unwrap().read_only = false;
 
-        // Tomt repo.
+        // Empty repository.
         server.lock().unwrap().empty = true;
         let mut remote = remote_at(&base, TOKEN);
         assert_eq!(
@@ -1280,7 +1281,7 @@ mod tests {
             })
         );
 
-        // Ladda upp, lista, ladda ner.
+        // Upload, list, download.
         let path =
             "ops/2026-11/1794000000000-0000_abcdef01_00000000-0000-4000-8000-000000000001.json";
         let content = "{\"by\": \"Åsa Öberg\"}".as_bytes();
@@ -1290,7 +1291,7 @@ mod tests {
 
         let listing = remote.list(None).unwrap();
         let Listing::Files { etag, files } = listing else {
-            panic!("väntade en fillista");
+            panic!("expected a file listing");
         };
         assert_eq!(
             files,
@@ -1311,7 +1312,7 @@ mod tests {
             Err(RemoteError::Other(_))
         ));
 
-        // Fel nyckel och ingen kontakt.
+        // Wrong key and no contact.
         assert_eq!(
             remote_at(&base, "fel-nyckel-123").list(None),
             Err(RemoteError::Denied)
@@ -1332,7 +1333,7 @@ mod tests {
         let mut b = Member::new("Bo", &FakeRemote::default());
         let id = a.submit(None, &create_action("Upright"));
 
-        // A:s transporttråd laddar upp, B:s laddar ner.
+        // A's transport thread uploads, B's downloads.
         let (tx, rx) = mpsc::channel();
         let spawn = |dir: &TempDir, tx: Sender<(RemoteStatus, bool)>| {
             spawn_transport(
@@ -1362,7 +1363,7 @@ mod tests {
         b.client.sync();
         assert_eq!(b.client.state().requests[&id].title, "Upright");
 
-        // B tar ärendet och väcker transporten i stället för att vänta 15 s.
+        // B takes the request and wakes the transport instead of waiting 15 s.
         b.submit(Some(id), &take_action("Bo"));
         transport_b.wake();
         let (status, _) = rx_b.recv_timeout(Duration::from_secs(20)).unwrap();

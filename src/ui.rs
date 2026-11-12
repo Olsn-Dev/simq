@@ -1,5 +1,5 @@
-//! egui-gränssnittet. Gör aldrig fil-I/O: allt sådant sker i bakgrundstråden
-//! (`sync::spawn`) och gränssnittet läser bara färdiga ögonblicksbilder.
+//! The egui user interface. Never does file I/O: all of that happens in the background
+//! thread (`sync::spawn`) and the interface only reads finished snapshots.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 
 use chrono::{Local, NaiveDate, TimeZone};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
@@ -21,8 +21,9 @@ use crate::model::{
 use crate::ops::NewAction;
 use crate::store::SeenState;
 use crate::sync::{self, Client, Cmd, Event, FolderStatus, Handle, Notice, Snapshot, Source};
+use crate::theme;
 
-/// Förslag på simuleringstyper (svenska, engelska).
+/// Suggested simulation types (Swedish, English).
 const SIM_TYPES: [(&str, &str); 8] = [
     ("FEA / hållfasthet", "FEA / structural"),
     ("CFD / aerodynamik", "CFD / aerodynamics"),
@@ -87,7 +88,7 @@ enum SettingsTab {
     Diagnostics,
 }
 
-/// Inmatning av en plats: typ + värde.
+/// Input of a location: kind + value.
 #[derive(Default)]
 struct LocInput {
     kind: LocKind,
@@ -190,7 +191,7 @@ impl Form {
         }
     }
 
-    /// Första problemet som hindrar att formuläret skickas.
+    /// The first problem that prevents the form from being submitted.
     fn problem(&self) -> Option<String> {
         match self {
             Form::New(f) => {
@@ -267,18 +268,18 @@ impl Form {
     }
 }
 
-/// Namn och mapp, används både vid första start och under Inställningar.
+/// Name and sync source, used both at first run and under Settings.
 struct IdentityForm {
     name: String,
     folder: Option<PathBuf>,
-    /// Sant = synka via GitHub med teamnyckel, falskt = delad mapp.
+    /// True = sync via GitHub with a team key, false = shared folder.
     github: bool,
     team_key: String,
     error: Option<String>,
     saved: bool,
 }
 
-/// Det användaren klickat på under en bildruta. Samlas in och utförs efteråt.
+/// What the user clicked during a frame. Collected and carried out afterwards.
 enum UiAction {
     Select(Uuid),
     CloseDetail,
@@ -309,6 +310,7 @@ pub struct App {
     notices: VecDeque<Notice>,
     next_token: u64,
     was_focused: bool,
+    logo: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -319,6 +321,8 @@ impl App {
         paths: Paths,
     ) -> std::io::Result<App> {
         let ctx = cc.egui_ctx.clone();
+        theme::apply(&ctx);
+        let logo = theme::load_logo(&ctx);
         let repaint_ctx = ctx.clone();
         let handle = sync::spawn(
             client,
@@ -327,7 +331,7 @@ impl App {
             Arc::new(move || repaint_ctx.request_repaint()),
         )?;
         let snapshot = handle.snapshot();
-        // Ligger en teamnyckel bredvid appen är den förifylld vid första start.
+        // If a team key file sits next to the app it is pre-filled at first run.
         let bundled_key = if config.is_complete() {
             None
         } else {
@@ -336,7 +340,7 @@ impl App {
         let identity = IdentityForm {
             name: config.display_name.clone(),
             folder: config.sync_folder.clone(),
-            // GitHub är förvalt tills en delad mapp har valts.
+            // GitHub is the default until a shared folder has been chosen.
             github: config.github.is_some() || config.sync_folder.is_none(),
             team_key: bundled_key.unwrap_or_default(),
             error: None,
@@ -362,6 +366,7 @@ impl App {
             notices: VecDeque::new(),
             next_token: 1,
             was_focused: false,
+            logo,
         })
     }
 
@@ -400,7 +405,7 @@ impl App {
         });
     }
 
-    /// Tar emot svar från bakgrundstråden och den senaste ögonblicksbilden.
+    /// Receives replies from the background thread and the latest snapshot.
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.handle.events.try_recv() {
             match event {
@@ -473,7 +478,7 @@ impl App {
         }
     }
 
-    /// Öppnar systemets mappväljare i en egen tråd så att gränssnittet inte låser sig.
+    /// Opens the system folder picker in its own thread so the interface does not freeze.
     fn pick_folder(&mut self) {
         if self.picker.is_some() {
             return;
@@ -497,7 +502,7 @@ impl App {
         }
     }
 
-    /// Byter språk direkt i gränssnittet. Bakgrundstråden sparar valet.
+    /// Changes language immediately in the interface. The background thread saves the choice.
     fn set_language(&mut self, lang: Lang) {
         i18n::set(lang);
         self.config.language = lang;
@@ -529,7 +534,7 @@ impl App {
         });
     }
 
-    /// Fälten för namn och mapp. Returnerar sant om Spara/Starta klickades.
+    /// The fields for name and sync source. Returns true if Save/Start was clicked.
     fn identity_fields(&mut self, ui: &mut egui::Ui, button: &str) -> bool {
         let busy = self.identity_pending.is_some();
         ui.label(RichText::new("Språk / Language").strong());
@@ -645,8 +650,7 @@ impl App {
                 self.identity.folder.is_some()
             };
             let ready = !busy && !self.identity.name.trim().is_empty() && source_ready;
-            clicked = ui
-                .add_enabled(ready, egui::Button::new(button))
+            clicked = theme::add_primary(ui, ready, button)
                 .on_disabled_hover_text(t(
                     "Fyll i visningsnamn och teamnyckel (eller välj en mapp)",
                     "Enter a display name and a team key (or choose a folder)",
@@ -663,142 +667,195 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Första start
+    // First run
     // -----------------------------------------------------------------------
 
     fn setup_ui(&mut self, ctx: &egui::Context) {
+        let logo = self.logo.clone();
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.heading(t("Välkommen till SimQ", "Welcome to SimQ"));
-                ui.add_space(6.0);
-                ui.label(t(
-                    "Lagets kö för simuleringsförfrågor.",
-                    "The team's queue for simulation requests.",
-                ));
-                ui.add_space(24.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(440.0, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        if self.identity_fields(ui, t("Starta", "Start")) {
-                            self.save_identity();
-                        }
-                    },
-                );
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space((ui.available_height() * 0.06).max(12.0));
+                    theme::logo(ui, logo.as_ref(), 84.0);
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(t("Välkommen till SimQ", "Welcome to SimQ"))
+                            .size(26.0)
+                            .strong(),
+                    );
+                    ui.weak(t(
+                        "Lagets kö för simuleringsförfrågor.",
+                        "The team's queue for simulation requests.",
+                    ));
+                    ui.add_space(18.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(484.0, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            egui::Frame::new()
+                                .fill(ui.visuals().window_fill)
+                                .stroke(ui.visuals().window_stroke)
+                                .corner_radius(egui::CornerRadius::same(12))
+                                .inner_margin(egui::Margin::same(22))
+                                .show(ui, |ui| {
+                                    ui.set_width(440.0);
+                                    if self.identity_fields(ui, t("Starta", "Start")) {
+                                        self.save_identity();
+                                    }
+                                });
+                        },
+                    );
+                    ui.add_space(20.0);
+                });
             });
         });
     }
 
     // -----------------------------------------------------------------------
-    // Huvudvy
+    // Main view
     // -----------------------------------------------------------------------
 
     fn top_ui(&mut self, ctx: &egui::Context) {
         let snapshot = Arc::clone(&self.snapshot);
         let can_write = self.can_write();
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading("SimQ");
-                ui.add_space(12.0);
-                if ui
-                    .add_enabled(
-                        can_write,
-                        egui::Button::new(t("+ Ny förfrågan", "+ New request")),
-                    )
-                    .on_disabled_hover_text(self.why_read_only())
-                    .clicked()
-                {
-                    self.form_error = None;
-                    self.form = Some(Form::New(NewForm {
-                        title: String::new(),
-                        description: String::new(),
-                        sim_type: String::new(),
-                        priority: 2,
-                        requester: self.config.display_name.clone(),
-                        deadline: String::new(),
-                        input: LocInput::default(),
-                    }));
-                }
-                ui.add_space(12.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text(t(
-                            "Sök titel, beställare eller typ",
-                            "Search title, requester or type",
-                        ))
-                        .desired_width(260.0),
-                );
-                if !self.search.is_empty() && ui.small_button(t("Rensa", "Clear")).clicked() {
-                    self.search.clear();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(t("Inställningar", "Settings")).clicked() {
-                        self.settings_open = true;
-                        self.identity.saved = false;
+        let logo = self.logo.clone();
+        egui::TopBottomPanel::top("top")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    theme::logo(ui, logo.as_ref(), 26.0);
+                    ui.label(RichText::new("SimQ").size(20.0).strong());
+                    ui.add_space(14.0);
+                    if theme::add_primary(ui, can_write, t("+ Ny förfrågan", "+ New request"))
+                        .on_disabled_hover_text(self.why_read_only())
+                        .clicked()
+                    {
+                        self.form_error = None;
+                        self.form = Some(Form::New(NewForm {
+                            title: String::new(),
+                            description: String::new(),
+                            sim_type: String::new(),
+                            priority: 2,
+                            requester: self.config.display_name.clone(),
+                            deadline: String::new(),
+                            input: LocInput::default(),
+                        }));
                     }
-                    if ui.button(t("Synka nu", "Sync now")).clicked() {
-                        self.handle.send(Cmd::SyncNow);
+                    ui.add_space(12.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text(t(
+                                "Sök titel, beställare eller typ",
+                                "Search title, requester or type",
+                            ))
+                            .desired_width(260.0),
+                    );
+                    if !self.search.is_empty() && ui.small_button(t("Rensa", "Clear")).clicked() {
+                        self.search.clear();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(t("Inställningar", "Settings")).clicked() {
+                            self.settings_open = true;
+                            self.identity.saved = false;
+                        }
+                        if ui.button(t("Synka nu", "Sync now")).clicked() {
+                            self.handle.send(Cmd::SyncNow);
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for tab in Tab::ALL {
+                        let count = snapshot
+                            .requests
+                            .iter()
+                            .filter(|r| tab.matches(r.status))
+                            .count();
+                        ui.selectable_value(
+                            &mut self.tab,
+                            tab,
+                            format!("{}  {count}", tab.label()),
+                        );
                     }
                 });
             });
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                for tab in Tab::ALL {
-                    let count = snapshot
-                        .requests
-                        .iter()
-                        .filter(|r| tab.matches(r.status))
-                        .count();
-                    ui.selectable_value(&mut self.tab, tab, format!("{} ({count})", tab.label()));
-                }
-            });
-            ui.add_space(4.0);
-        });
     }
 
     fn status_ui(&mut self, ctx: &egui::Context) {
         let snapshot = Arc::clone(&self.snapshot);
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                let error_color = ui.visuals().error_fg_color;
-                let warn_color = ui.visuals().warn_fg_color;
-                let local_ok = matches!(
-                    snapshot.status,
-                    FolderStatus::Ok | FolderStatus::Starting | FolderStatus::Missing
-                );
-                if let (Some(remote), true) = (&snapshot.remote, local_ok) {
-                    remote_status_ui(ui, remote);
-                } else {
-                match &snapshot.status {
-                    FolderStatus::Ok => match snapshot.last_sync_ms {
-                        Some(ms) => ui.label(format!("{} {}", t("Synkad", "Synced"), format_clock(ms))),
-                        None => ui.label(t("Synkar…", "Syncing…")),
-                    },
-                    FolderStatus::Starting => ui.label(t("Synkar…", "Syncing…")),
-                    FolderStatus::NotConfigured => ui.label(t("Ingen mapp vald", "No folder selected")),
-                    FolderStatus::Missing => {
-                        ui.colored_label(warn_color, t("Mappen hittas inte, visar sparad data", "Folder not found, showing saved data"))
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let ok_color = theme::status_color(Status::Done, ui.visuals().dark_mode);
+                    let idle_color = ui.visuals().weak_text_color();
+                    let warn_color = ui.visuals().warn_fg_color;
+                    let error_color = ui.visuals().error_fg_color;
+                    let local_ok = matches!(
+                        snapshot.status,
+                        FolderStatus::Ok | FolderStatus::Starting | FolderStatus::Missing
+                    );
+                    if let (Some(remote), true) = (&snapshot.remote, local_ok) {
+                        remote_status_ui(ui, remote);
+                    } else {
+                        let (color, text) = match &snapshot.status {
+                            FolderStatus::Ok => match snapshot.last_sync_ms {
+                                Some(ms) => (
+                                    ok_color,
+                                    format!("{} {}", t("Synkad", "Synced"), format_clock(ms)),
+                                ),
+                                None => (idle_color, t("Synkar…", "Syncing…").to_string()),
+                            },
+                            FolderStatus::Starting => {
+                                (idle_color, t("Synkar…", "Syncing…").to_string())
+                            }
+                            FolderStatus::NotConfigured => (
+                                idle_color,
+                                t("Ingen mapp vald", "No folder selected").to_string(),
+                            ),
+                            FolderStatus::Missing => (
+                                warn_color,
+                                t(
+                                    "Mappen hittas inte, visar sparad data",
+                                    "Folder not found, showing saved data",
+                                )
+                                .to_string(),
+                            ),
+                            FolderStatus::NewerFormat => (
+                                warn_color,
+                                t(
+                                    "Mappen kräver en nyare version. Uppdatera appen för att kunna göra ändringar.",
+                                    "The folder requires a newer version. Update the app to make changes.",
+                                )
+                                .to_string(),
+                            ),
+                            FolderStatus::Error(text) => (error_color, one_line(text)),
+                        };
+                        theme::dot(ui, color);
+                        ui.label(text);
                     }
-                    FolderStatus::NewerFormat => ui.colored_label(
-                        warn_color,
-                        t("Mappen kräver en nyare version. Uppdatera appen för att kunna göra ändringar.", "The folder requires a newer version. Update the app to make changes."),
-                    ),
-                    FolderStatus::Error(text) => ui.colored_label(error_color, one_line(text)),
-                };
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(one_line(&self.config.display_name));
-                    if snapshot.unsupported_seen {
-                        ui.separator();
-                        ui.colored_label(warn_color, t("Ny version av appen finns", "A new version of the app is available"));
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(one_line(&self.config.display_name));
+                        if snapshot.unsupported_seen {
+                            ui.separator();
+                            ui.colored_label(
+                                warn_color,
+                                t(
+                                    "Ny version av appen finns",
+                                    "A new version of the app is available",
+                                ),
+                            );
+                        }
+                    });
                 });
             });
-            ui.add_space(2.0);
-        });
     }
 
     fn table_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
@@ -831,9 +888,8 @@ impl App {
                 });
                 return;
             }
-            // Klick ska välja raden, inte markera text.
+            // A click should select the row, not select text.
             ui.style_mut().interaction.selectable_labels = false;
-            let dark = ui.visuals().dark_mode;
             let overdue_color = ui.visuals().error_fg_color;
             TableBuilder::new(ui)
                 .striped(true)
@@ -844,12 +900,12 @@ impl App {
                 .column(Column::remainder().at_least(160.0).clip(true))
                 .column(Column::initial(130.0).at_least(50.0).clip(true))
                 .column(Column::initial(70.0).at_least(50.0).clip(true))
-                .column(Column::initial(90.0).at_least(60.0).clip(true))
+                .column(Column::initial(110.0).at_least(70.0).clip(true))
                 .column(Column::initial(120.0).at_least(60.0).clip(true))
                 .column(Column::initial(120.0).at_least(60.0).clip(true))
                 .column(Column::initial(90.0).at_least(70.0).clip(true))
                 .column(Column::initial(130.0).at_least(60.0).clip(true))
-                .header(24.0, |mut header| {
+                .header(26.0, |mut header| {
                     for title in [
                         "#",
                         t("Titel", "Title"),
@@ -862,12 +918,17 @@ impl App {
                         t("Rapport / resultat", "Report / results"),
                     ] {
                         header.col(|ui| {
-                            ui.strong(title);
+                            ui.label(
+                                RichText::new(title)
+                                    .size(12.0)
+                                    .strong()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
                         });
                     }
                 })
                 .body(|body| {
-                    body.rows(26.0, rows.len(), |mut row| {
+                    body.rows(32.0, rows.len(), |mut row| {
                         let request = rows[row.index()];
                         row.set_selected(selected == Some(request.request_id));
                         row.col(|ui| {
@@ -880,7 +941,8 @@ impl App {
                             cell(ui, &request.sim_type);
                         });
                         row.col(|ui| {
-                            let text = RichText::new(priority_label(request.priority));
+                            let text = RichText::new(priority_label(request.priority))
+                                .color(theme::priority_color(request.priority, ui));
                             ui.label(if request.priority == 1 {
                                 text.strong()
                             } else {
@@ -888,10 +950,7 @@ impl App {
                             });
                         });
                         row.col(|ui| {
-                            ui.colored_label(
-                                status_color(request.status, dark),
-                                request.status.label(),
-                            );
+                            theme::status_pill(ui, request.status);
                         });
                         row.col(|ui| {
                             cell(ui, &request.requester);
@@ -922,7 +981,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Detaljvy
+    // Detail view
     // -----------------------------------------------------------------------
 
     fn detail_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
@@ -940,19 +999,20 @@ impl App {
 
         egui::SidePanel::right("detail")
             .resizable(true)
-            .default_width(430.0)
-            .min_width(320.0)
+            .default_width(440.0)
+            .min_width(330.0)
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(16, 10)),
+            )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(6.0);
+                        ui.add_space(2.0);
                         ui.horizontal(|ui| {
+                            theme::status_pill(ui, request.status);
                             ui.weak(format!("#{}", request.seq));
-                            ui.colored_label(
-                                status_color(request.status, ui.visuals().dark_mode),
-                                RichText::new(request.status.label()).strong(),
-                            );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -962,15 +1022,18 @@ impl App {
                                 },
                             );
                         });
+                        ui.add_space(2.0);
                         ui.add(
-                            egui::Label::new(RichText::new(one_line(&request.title)).heading())
-                                .wrap(),
+                            egui::Label::new(
+                                RichText::new(one_line(&request.title)).heading().strong(),
+                            )
+                            .wrap(),
                         );
-                        ui.add_space(6.0);
 
-                        // Klara ärenden: rapport, resultat och sammanfattning överst.
+                        // Done requests: report, results and summary at the top.
                         if request.status == Status::Done {
-                            ui.group(|ui| {
+                            ui.add_space(8.0);
+                            theme::card(ui).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 location_field(
                                     ui,
@@ -984,34 +1047,45 @@ impl App {
                                     request.results.as_ref(),
                                     actions,
                                 );
-                                ui.label(RichText::new(t("Sammanfattning", "Summary")).strong());
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(t("Sammanfattning", "Summary"))
+                                        .size(13.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                );
                                 ui.label(clean_text(&request.summary));
                             });
-                            ui.add_space(6.0);
                         }
                         if matches!(request.status, Status::Failed | Status::Cancelled) {
-                            ui.group(|ui| {
+                            ui.add_space(8.0);
+                            theme::card(ui).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.label(RichText::new(t("Anteckning", "Note")).strong());
+                                ui.label(
+                                    RichText::new(t("Anteckning", "Note"))
+                                        .size(13.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                );
                                 if request.note.trim().is_empty() {
                                     ui.weak(t("Ingen anteckning", "No note"));
                                 } else {
                                     ui.label(clean_text(&request.note));
                                 }
                             });
-                            ui.add_space(6.0);
                         }
 
+                        theme::section(ui, t("Detaljer", "Details"));
                         text_field(ui, t("Typ", "Type"), &request.sim_type);
-                        text_field(
-                            ui,
-                            t("Prioritet", "Priority"),
-                            priority_label(request.priority),
-                        );
+                        ui.horizontal_top(|ui| {
+                            theme::field_label(ui, t("Prioritet", "Priority"));
+                            ui.label(
+                                RichText::new(priority_label(request.priority))
+                                    .color(theme::priority_color(request.priority, ui)),
+                            );
+                        });
                         text_field(ui, t("Beställare", "Requester"), &request.requester);
                         text_field(ui, t("Utförare", "Assignee"), &request.assignee);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Deadline:").strong());
+                        ui.horizontal_top(|ui| {
+                            theme::field_label(ui, "Deadline");
                             if request.deadline.is_empty() {
                                 ui.weak("–");
                             } else if is_overdue(request, today) {
@@ -1032,54 +1106,71 @@ impl App {
                         }
                         location_field(ui, t("Indata", "Input"), request.input.as_ref(), actions);
 
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(t("Beskrivning", "Description")).strong());
+                        theme::section(ui, t("Beskrivning", "Description"));
                         if request.description.trim().is_empty() {
                             ui.weak(t("Ingen beskrivning", "No description"));
                         } else {
                             ui.label(clean_text(&request.description));
                         }
 
-                        ui.add_space(10.0);
+                        if request.status != Status::Done {
+                            ui.add_space(14.0);
+                        }
                         ui.horizontal_wrapped(|ui| {
                             let button = |ui: &mut egui::Ui, label: &str| {
                                 ui.add_enabled(can_write, egui::Button::new(label))
                                     .on_disabled_hover_text(why)
                                     .clicked()
                             };
+                            let primary = |ui: &mut egui::Ui, label: &str| {
+                                theme::add_primary(ui, can_write, label)
+                                    .on_disabled_hover_text(why)
+                                    .clicked()
+                            };
                             match request.status {
-                                Status::Queued | Status::Running => {
-                                    if request.status == Status::Queued
-                                        && button(ui, t("Ta ärendet", "Take request"))
-                                    {
+                                Status::Queued => {
+                                    if primary(ui, t("Ta ärendet", "Take request")) {
                                         actions.push(UiAction::Take(id));
                                     }
                                     if button(ui, t("Markera klar…", "Mark as done…")) {
                                         actions.push(UiAction::OpenFinish(id));
                                     }
-                                    if button(ui, t("Misslyckad…", "Failed…")) {
-                                        actions.push(UiAction::OpenNote(id, true));
-                                    }
-                                    if button(ui, t("Avbryt…", "Cancel…")) {
-                                        actions.push(UiAction::OpenNote(id, false));
+                                }
+                                Status::Running => {
+                                    if primary(ui, t("Markera klar…", "Mark as done…")) {
+                                        actions.push(UiAction::OpenFinish(id));
                                     }
                                 }
                                 Status::Failed | Status::Cancelled => {
-                                    if button(ui, t("Köa om", "Requeue")) {
+                                    if primary(ui, t("Köa om", "Requeue")) {
                                         actions.push(UiAction::Requeue(id));
                                     }
                                 }
                                 Status::Done => {}
                             }
+                            if request.status.is_active() {
+                                if button(ui, t("Misslyckad…", "Failed…")) {
+                                    actions.push(UiAction::OpenNote(id, true));
+                                }
+                                if button(ui, t("Avbryt…", "Cancel…")) {
+                                    actions.push(UiAction::OpenNote(id, false));
+                                }
+                            }
                         });
 
-                        ui.add_space(10.0);
-                        ui.separator();
-                        ui.label(RichText::new(t("Historik", "History")).strong());
+                        theme::section(ui, t("Historik", "History"));
                         ui.add_space(2.0);
                         let empty = Vec::new();
                         for entry in snapshot.history.get(&id).unwrap_or(&empty) {
                             ui.horizontal_wrapped(|ui| {
+                                theme::dot(
+                                    ui,
+                                    if entry.problem.is_some() {
+                                        ui.visuals().warn_fg_color
+                                    } else {
+                                        ui.visuals().weak_text_color()
+                                    },
+                                );
                                 ui.weak(format_time(entry.at_ms));
                                 ui.label(RichText::new(one_line(&entry.by)).strong());
                                 ui.label(&entry.what);
@@ -1096,7 +1187,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Formulär
+    // Forms
     // -----------------------------------------------------------------------
 
     fn form_ui(&mut self, ctx: &egui::Context) {
@@ -1128,7 +1219,7 @@ impl App {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 let problem = form.problem();
-                // Egen rad som radbryts, så att fönstret inte växer på bredden.
+                // Own line that wraps, so that the window does not grow wider.
                 if busy {
                     ui.weak(t("Sparar…", "Saving…"));
                 } else if let Some(problem) = &problem {
@@ -1140,8 +1231,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let ready = problem.is_none() && !busy && writable;
                     let hint = problem.clone().unwrap_or_else(|| why.to_string());
-                    if ui
-                        .add_enabled(ready, egui::Button::new(form.submit_label()))
+                    if theme::add_primary(ui, ready, form.submit_label())
                         .on_disabled_hover_text(hint)
                         .clicked()
                     {
@@ -1171,7 +1261,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Inställningar och diagnostik
+    // Settings and diagnostics
     // -----------------------------------------------------------------------
 
     fn settings_ui(&mut self, ctx: &egui::Context) {
@@ -1216,7 +1306,7 @@ impl App {
             });
         if !open {
             self.settings_open = false;
-            // Osparade ändringar kastas.
+            // Unsaved changes are discarded.
             self.identity.name = self.config.display_name.clone();
             self.identity.folder = self.config.sync_folder.clone();
             self.identity.github = self.config.github.is_some();
@@ -1230,37 +1320,37 @@ impl App {
             .auto_shrink([false, false])
             .max_height(440.0)
             .show(ui, |ui| {
-                text_field(ui, t("Appversion", "App version"), env!("CARGO_PKG_VERSION"));
-                text_field(ui, t("Antal händelser", "Number of events"), &snapshot.op_count.to_string());
-                text_field(ui, t("Antal ärenden", "Number of requests"), &snapshot.requests.len().to_string());
+                stacked_field(ui, t("Appversion", "App version"), env!("CARGO_PKG_VERSION"));
+                stacked_field(ui, t("Antal händelser", "Number of events"), &snapshot.op_count.to_string());
+                stacked_field(ui, t("Antal ärenden", "Number of requests"), &snapshot.requests.len().to_string());
                 let last_sync = snapshot
                     .last_sync_ms
                     .map(format_time)
                     .unwrap_or_else(|| "–".to_string());
-                text_field(ui, t("Senaste synk", "Last sync"), &last_sync);
+                stacked_field(ui, t("Senaste synk", "Last sync"), &last_sync);
                 let folder = snapshot
                     .folder
                     .as_ref()
                     .map(|f| f.display().to_string())
                     .unwrap_or_default();
                 if let Some(remote) = &snapshot.remote {
-                    text_field(ui, t("GitHub-repo", "GitHub repository"), &remote.repo);
-                    text_field(
+                    stacked_field(ui, t("GitHub-repo", "GitHub repository"), &remote.repo);
+                    stacked_field(
                         ui,
                         t("Väntar på att skickas", "Waiting to be sent"),
                         &remote.pending.to_string(),
                     );
-                    text_field(ui, t("Lokal kopia", "Local copy"), &folder);
+                    stacked_field(ui, t("Lokal kopia", "Local copy"), &folder);
                 } else {
-                    text_field(ui, t("Delad mapp", "Shared folder"), &folder);
+                    stacked_field(ui, t("Delad mapp", "Shared folder"), &folder);
                 }
-                text_field(ui, "Cache", &self.paths.cache_file.display().to_string());
-                text_field(
+                stacked_field(ui, "Cache", &self.paths.cache_file.display().to_string());
+                stacked_field(
                     ui,
                     t("Inställningar", "Settings"),
                     &self.paths.config_file.display().to_string(),
                 );
-                text_field(ui, t("Klient-ID", "Client ID"), &snapshot.client_id.to_string());
+                stacked_field(ui, t("Klient-ID", "Client ID"), &snapshot.client_id.to_string());
                 if snapshot.unsupported_seen {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
@@ -1430,7 +1520,7 @@ impl App {
                     }
                 }
                 UiAction::OpenUrl(url) => {
-                    // Bara http(s) öppnas, aldrig andra scheman.
+                    // Only http(s) is opened, never other schemes.
                     if is_http_url(&url) {
                         ctx.open_url(egui::OpenUrl::new_tab(url));
                     }
@@ -1461,35 +1551,36 @@ impl eframe::App for App {
 }
 
 // ---------------------------------------------------------------------------
-// Fristående hjälpfunktioner
+// Free-standing helper functions
 // ---------------------------------------------------------------------------
 
-/// Statusraden när appen synkar mot GitHub.
+/// The status bar when the app syncs with GitHub.
 fn remote_status_ui(ui: &mut egui::Ui, remote: &RemoteStatus) {
-    match &remote.state {
-        RemoteState::Starting => {
-            ui.label(t("Ansluter till GitHub…", "Connecting to GitHub…"));
-        }
-        RemoteState::Ok => {
-            let at = remote.last_ok_ms.map(format_clock).unwrap_or_default();
-            ui.label(format!(
-                "{} {at}",
-                t("Synkad med GitHub", "Synced with GitHub")
-            ));
-        }
-        RemoteState::Offline => {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                t(
-                    "Ingen kontakt med GitHub, visar sparad data",
-                    "No contact with GitHub, showing saved data",
-                ),
-            );
-        }
-        RemoteState::Error(text) => {
-            ui.colored_label(ui.visuals().error_fg_color, one_line(text));
-        }
-    }
+    let (color, text) = match &remote.state {
+        RemoteState::Starting => (
+            ui.visuals().weak_text_color(),
+            t("Ansluter till GitHub…", "Connecting to GitHub…").to_string(),
+        ),
+        RemoteState::Ok => (
+            theme::status_color(Status::Done, ui.visuals().dark_mode),
+            format!(
+                "{} {}",
+                t("Synkad med GitHub", "Synced with GitHub"),
+                remote.last_ok_ms.map(format_clock).unwrap_or_default()
+            ),
+        ),
+        RemoteState::Offline => (
+            ui.visuals().warn_fg_color,
+            t(
+                "Ingen kontakt med GitHub, visar sparad data",
+                "No contact with GitHub, showing saved data",
+            )
+            .to_string(),
+        ),
+        RemoteState::Error(text) => (ui.visuals().error_fg_color, one_line(text)),
+    };
+    theme::dot(ui, color);
+    ui.label(text);
     if remote.pending > 0 {
         ui.weak(if is_en() {
             format!("· {} change(s) waiting to be sent", remote.pending)
@@ -1499,7 +1590,7 @@ fn remote_status_ui(ui: &mut egui::Ui, remote: &RemoteStatus) {
     }
 }
 
-/// Letar efter `simq-teamkey.txt` bredvid appen (eller bredvid .app-paketet på macOS).
+/// Looks for `simq-teamkey.txt` next to the app (or next to the .app bundle on macOS).
 fn find_team_key_file() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     exe.ancestors().skip(1).take(4).find_map(|dir| {
@@ -1527,7 +1618,7 @@ fn local_time(ms: u64) -> Option<chrono::DateTime<Local>> {
     Local.timestamp_millis_opt(i64::try_from(ms).ok()?).single()
 }
 
-/// Datum och tid i användarens lokala tid.
+/// Date and time in the user's local time.
 fn format_time(ms: u64) -> String {
     local_time(ms)
         .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
@@ -1540,52 +1631,54 @@ fn format_clock(ms: u64) -> String {
         .unwrap_or_else(|| "–".to_string())
 }
 
-fn status_color(status: Status, dark: bool) -> Color32 {
-    match (status, dark) {
-        (Status::Queued, true) => Color32::from_rgb(120, 175, 255),
-        (Status::Queued, false) => Color32::from_rgb(25, 95, 200),
-        (Status::Running, true) => Color32::from_rgb(255, 185, 80),
-        (Status::Running, false) => Color32::from_rgb(180, 100, 0),
-        (Status::Done, true) => Color32::from_rgb(120, 210, 130),
-        (Status::Done, false) => Color32::from_rgb(20, 125, 50),
-        (Status::Failed, true) => Color32::from_rgb(255, 120, 120),
-        (Status::Failed, false) => Color32::from_rgb(195, 40, 40),
-        (Status::Cancelled, true) => Color32::from_gray(160),
-        (Status::Cancelled, false) => Color32::from_gray(105),
-    }
-}
-
-/// En tabellcell med en rad text som klipps om den inte får plats.
+/// A table cell with one line of text that is clipped if it does not fit.
 fn cell(ui: &mut egui::Ui, text: &str) {
     ui.add(egui::Label::new(one_line(text)).truncate());
 }
 
+/// A label and a value on one row, with the labels lined up in a column.
 fn text_field(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(format!("{label}:")).strong());
-        if value.trim().is_empty() {
-            ui.weak("–");
-        } else {
-            ui.label(one_line(value));
-        }
+    ui.horizontal_top(|ui| {
+        theme::field_label(ui, label);
+        ui.vertical(|ui| {
+            if value.trim().is_empty() {
+                ui.weak("–");
+            } else {
+                ui.add(egui::Label::new(one_line(value)).wrap());
+            }
+        });
     });
 }
 
-/// Visar en plats. Bara http(s)-värden blir klickbara länkar, allt annat är ren text.
+/// Like `text_field` but with the label above the value, for long labels and paths.
+fn stacked_field(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(
+        RichText::new(label)
+            .size(13.0)
+            .color(ui.visuals().weak_text_color()),
+    );
+    if value.trim().is_empty() {
+        ui.weak("–");
+    } else {
+        ui.add(egui::Label::new(one_line(value)).wrap());
+    }
+    ui.add_space(4.0);
+}
+
+/// Shows a location. Only http(s) values become clickable links, everything else is plain text.
 fn location_field(
     ui: &mut egui::Ui,
     label: &str,
     location: Option<&Location>,
     actions: &mut Vec<UiAction>,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(format!("{label}:")).strong());
-        match location {
+    ui.horizontal_top(|ui| {
+        theme::field_label(ui, label);
+        ui.vertical(|ui| match location {
             None => {
                 ui.weak("–");
             }
             Some(location) => {
-                ui.weak(format!("{}:", location.kind.label()));
                 if is_http_url(&location.value) {
                     if ui
                         .link(&location.value)
@@ -1595,17 +1688,24 @@ fn location_field(
                         actions.push(UiAction::OpenUrl(location.value.clone()));
                     }
                 } else {
-                    ui.label(clean_text(&location.value));
+                    ui.add(egui::Label::new(clean_text(&location.value)).wrap());
                 }
-                if ui.small_button(t("Kopiera", "Copy")).clicked() {
-                    ui.ctx().copy_text(location.value.clone());
-                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(location.kind.label())
+                            .size(12.0)
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                    if ui.small_button(t("Kopiera", "Copy")).clicked() {
+                        ui.ctx().copy_text(location.value.clone());
+                    }
+                });
             }
-        }
+        });
     });
 }
 
-/// Snabblänk i tabellraden för klara ärenden.
+/// Quick link in the table row for done requests.
 fn quick_link(
     ui: &mut egui::Ui,
     label: &str,

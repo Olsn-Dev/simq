@@ -1,140 +1,148 @@
-# SimQ
+<p align="center">
+  <img src="assets/icon-256.png" width="112" alt="SimQ icon">
+</p>
 
-[![Release](https://github.com/Olsn-Dev/simq/actions/workflows/release.yml/badge.svg)](https://github.com/Olsn-Dev/simq/actions/workflows/release.yml)
+<h1 align="center">SimQ</h1>
 
-**Kön för lagets simuleringsförfrågor.** En liten skrivbordsapp för Formula Student-lag som håller ordning på vilka simuleringar som behövs, vem som gör dem, och var indata, rapport och resultat finns.
+<p align="center">
+  <strong>The queue for your team's simulation requests.</strong><br>
+  A small desktop app for Formula Student teams that keeps track of which simulations are needed,
+  who is doing them, and where the input, report and results are.
+</p>
 
-*A small desktop app that tracks a Formula Student team's simulation requests: what is needed, who is doing it, and where the input, report and results are. Available in Swedish and English. No server needed.*
+<p align="center">
+  <a href="https://github.com/Olsn-Dev/simq/actions/workflows/release.yml"><img src="https://github.com/Olsn-Dev/simq/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+</p>
 
-![SimQ med kön till vänster och ett ärende öppet till höger](docs/screenshot.jpg)
+![SimQ with the queue on the left and a request open on the right](docs/screenshot.jpg)
 
-- **Ingen server.** Laget synkar via ett privat GitHub-repo eller en delad mapp.
-- **Fungerar utan nät.** Ändringar skickas när nätet är tillbaka.
-- **Inga krockar.** Tar två personer samma ärende samtidigt får alla samma vinnare.
-- **Svenska och engelska.** Varje person väljer själv.
-- **En enda fil** för Windows, macOS och Linux. Ingenting installeras.
+- **No server.** The team syncs through a private GitHub repository or a shared folder.
+- **Works offline.** Changes are sent when the network is back.
+- **No clashes.** If two people take the same request at the same time, everyone ends up with the same winner.
+- **Swedish and English.** Each person chooses their own language.
+- **A single file** for Windows, macOS and Linux. Nothing to install.
 
-**Innehåll:** [Så fungerar det](#så-fungerar-det) · [Kom igång med GitHub](#kom-igång-med-github) · [Delad mapp](#kom-igång-med-en-delad-mapp-alternativ) · [Ladda ner](#ladda-ner-och-starta) · [Bra att veta](#bra-att-veta) · [För utvecklare](#för-utvecklare)
+**Contents:** [How it works](#how-it-works) · [Get started with GitHub](#get-started-with-github) · [Shared folder](#get-started-with-a-shared-folder-alternative) · [Download](#download-and-start) · [Good to know](#good-to-know) · [For developers](#for-developers)
 
-SimQ kör inga simuleringar. Själva jobbet gör du som vanligt i Ansys, SolidWorks, Fusion eller vad du nu använder. SimQ är bara kön och anslagstavlan.
+SimQ does not run any simulations. You do the actual work as usual in Ansys, SolidWorks, Fusion or whatever you use. SimQ is only the queue and the notice board.
 
-Det finns ingen egen server. Appen på din dator synkar med de andras på ett av två sätt:
+There is no server of its own. The app on your computer syncs with everyone else's in one of two ways:
 
-- **GitHub (rekommenderas):** ett privat GitHub-repo och en delad teamnyckel. Lagmedlemmarna behöver bara appen och nyckeln.
-- **Delad mapp:** en vanlig mapp som synkas av t.ex. Google Drive för skrivbord.
+- **GitHub (recommended):** a private GitHub repository and a shared team key. Team members only need the app and the key.
+- **Shared folder:** an ordinary folder synced by, for example, Google Drive for desktop.
 
-## Så fungerar det
+## How it works
 
-1. Någon lägger upp ett behov ("Ny förfrågan").
-2. Någon annan ser det i kön och klickar "Ta ärendet".
-3. När simuleringen är klar klickar hen "Markera klar" och fyller i var rapporten och resultaten finns, plus en kort sammanfattning.
-4. Alla i laget ser samma lista och kan öppna rapport och resultat därifrån.
+1. Someone adds a need ("New request").
+2. Someone else sees it in the queue and clicks "Take request".
+3. When the simulation is done they click "Mark as done" and fill in where the report and the results are, plus a short summary.
+4. Everyone on the team sees the same list and can open the report and results from there.
 
-Appen lagrar aldrig några filer åt dig. Den sparar bara en länk eller en beskrivning av var filen ligger:
+The app never stores any files for you. It only saves a link or a description of where the file is:
 
-| Typ | Vad du fyller i |
+| Kind | What you fill in |
 | --- | --- |
-| Google Drive | En länk som börjar med `http://` eller `https://` |
-| Vault | En kort beskrivning, t.ex. `Uprights/v3/Assembly.iam` |
-| Annat | Fri text, t.ex. `USB-stickan i verkstadslådan` |
+| Google Drive | A link starting with `http://` or `https://` |
+| Vault | A short description, e.g. `Uprights/v3/Assembly.iam` |
+| Other | Free text, e.g. `The USB stick in the workshop drawer` |
 
-## Kom igång med GitHub
+## Get started with GitHub
 
-### En person sätter upp det (en gång)
+### One person sets it up (once)
 
-1. **Skapa ett privat repo** på GitHub, t.ex. `simq-data`. Kryssa i "Add a README file" så att repot inte är helt tomt. Använd repot bara till det här.
-2. **Skapa en åtkomstnyckel** som bara gäller det repot: GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
-   - Repository access: **Only select repositories** och välj `simq-data`.
+1. **Create a private repository** on GitHub, e.g. `simq-data`. Tick "Add a README file" so the repository is not completely empty. Use the repository only for this.
+2. **Create an access token** that only applies to that repository: GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
+   - Repository access: **Only select repositories** and choose `simq-data`.
    - Permissions → Repository permissions → **Contents: Read and write**.
-   - Välj ett utgångsdatum. När nyckeln går ut måste du skapa en ny och dela ut den igen.
-3. **Sätt ihop teamnyckeln:** `ägare/repo:token`, till exempel `mittlag/simq-data:github_pat_…`.
-4. **Dela teamnyckeln med laget** i en privat kanal.
+   - Choose an expiry date. When the token expires you have to create a new one and hand it out again.
+3. **Put the team key together:** `owner/repo:token`, for example `myteam/simq-data:github_pat_…`.
+4. **Share the team key with the team** in a private channel.
 
-Teamnyckeln är ett lösenord till kön. Alla som har den kan läsa och ändra allt i repot. Lägg den aldrig i ett publikt repo, på en webbsida eller i en publik chatt. GitHub spärrar dessutom nycklar som hittas i publika repon. Om nyckeln kommer på avvägar: ta bort den på GitHub och skapa en ny.
+The team key is a password to the queue. Anyone who has it can read and change everything in the repository. Never put it in a public repository, on a web page or in a public chat. GitHub also revokes tokens it finds in public repositories. If the key gets out: delete it on GitHub and create a new one.
 
-### Varje lagmedlem
+### Every team member
 
-1. Ladda ner appen från **Releases** och starta den (se nedan om varningen första gången).
-2. Välj språk, skriv ditt visningsnamn, välj **GitHub** och klistra in teamnyckeln.
-3. Klicka **Starta**.
+1. Download the app from **Releases** and start it (see below about the warning the first time).
+2. Choose language, type your display name, choose **GitHub** and paste the team key.
+3. Click **Start**.
 
-Du behöver inget eget GitHub-konto och inget annat program.
+You do not need a GitHub account of your own, or any other program.
 
-Tips: lägger du en textfil som heter `simq-teamkey.txt` med teamnyckeln i samma mapp som appen fylls nyckeln i automatiskt vid första start. Då räcker det att skriva sitt namn.
+Tip: if you put a text file called `simq-teamkey.txt` containing the team key in the same folder as the app, the key is filled in automatically at first start. Then all that is left is typing your name.
 
-## Kom igång med en delad mapp (alternativ)
+## Get started with a shared folder (alternative)
 
-1. Installera Google Drive för skrivbord från <https://www.google.com/drive/download/> och logga in.
-2. En person skapar en mapp som heter **SimQ** i Google Drive och delar den med laget. Alla måste ha **redigeringsrätt**.
-3. Alla lägger till mappen i sin Drive: öppna den under "Delas med mig", högerklicka och välj **Ordna → Lägg till genväg**. Om Drive kör i strömningsläge: högerklicka på mappen i Utforskaren/Finder och välj **Offlineåtkomst → Tillgänglig offline**.
-4. Starta appen, välj **Delad mapp**, klicka "Välj mapp…" och peka ut mappen **SimQ**.
+1. Install Google Drive for desktop from <https://www.google.com/drive/download/> and sign in.
+2. One person creates a folder called **SimQ** in Google Drive and shares it with the team. Everyone needs **edit access**.
+3. Everyone adds the folder to their own Drive: open it under "Shared with me", right-click and choose **Organise → Add shortcut**. If Drive runs in streaming mode: right-click the folder in Explorer/Finder and choose **Offline access → Available offline**.
+4. Start the app, choose **Shared folder**, click "Choose folder…" and point to the **SimQ** folder.
 
-## Ladda ner och starta
+## Download and start
 
-Hämta den senaste versionen för ditt system under **Releases** på GitHub-sidan och packa upp:
+Get the latest version for your system under **Releases** on the GitHub page:
 
-- **Windows:** packa upp zip-filen och dubbelklicka på `SimQ.exe`.
-- **macOS:** öppna `.dmg`-filen och dra `SimQ` till Program.
-- **Linux:** packa upp `tar.gz`-filen och kör `./simq`.
+- **Windows:** unpack the zip file and double-click `SimQ.exe`.
+- **macOS:** open the `.dmg` file and drag `SimQ` to Applications.
+- **Linux:** unpack the `tar.gz` file and run `./simq`.
 
-Appen är en enda fristående fil. Ingenting behöver installeras.
+The app is a single self-contained file. Nothing needs to be installed.
 
-Första gången väljer du språk (**Svenska** eller **English**), visningsnamn och hur appen ska synka. Varje person väljer sitt eget språk, och laget kan blanda fritt. Allt kan ändras senare under **Inställningar**.
+The first time, you choose language (**Svenska** or **English**), display name and how the app should sync. Each person chooses their own language, and the team can mix freely. Everything can be changed later under **Settings**.
 
-### Appen är inte signerad
+### The app is not signed
 
-Vi har inget utvecklarcertifikat, så både Windows och macOS varnar första gången du startar appen.
+We have no developer certificate, so both Windows and macOS warn the first time you start the app.
 
-**Windows (SmartScreen):** När rutan "Windows skyddade datorn" visas, klicka **Mer information** och sedan **Kör ändå**.
+**Windows (SmartScreen):** When the "Windows protected your PC" box appears, click **More info** and then **Run anyway**.
 
-**macOS (Gatekeeper):** Försök öppna appen en gång (du får ett meddelande om att den inte kan öppnas). Gå sedan till **Systeminställningar → Integritet och säkerhet**, bläddra ner och klicka **Öppna ändå** bredvid SimQ. På äldre macOS räcker det att högerklicka på appen och välja **Öppna**. Du behöver bara göra det en gång.
+**macOS (Gatekeeper):** Try to open the app once (you get a message that it cannot be opened). Then go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to SimQ. On older macOS it is enough to right-click the app and choose **Open**. You only need to do this once.
 
-Om det ändå inte fungerar på macOS kan du ta bort karantänmärkningen i Terminal:
+If it still does not work on macOS you can remove the quarantine flag in Terminal:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/SimQ.app
 ```
 
-## Bra att veta
+## Good to know
 
-### Det tar en stund innan andras ändringar syns
+### It takes a moment before other people's changes show up
 
-Appen letar efter nyheter var 15:e sekund, när fönstret får fokus och när du klickar **Synka nu**. Med GitHub syns andras ändringar normalt inom en halv minut. Med en delad mapp behöver Drive också tid på sig, så räkna med några sekunder upp till en minut. Statusraden längst ned visar när appen senast synkade.
+The app looks for news every 15 seconds, when the window gets focus and when you click **Sync now**. With GitHub, other people's changes normally show up within half a minute. With a shared folder, Drive also needs time, so expect a few seconds up to a minute. The status bar at the bottom shows when the app last synced.
 
-### "Någon hann före"
+### "Someone got there first"
 
-Eftersom det finns en fördröjning kan två personer hinna ta samma ärende nästan samtidigt. Då gäller den som var först. Alla appar räknar fram samma vinnare, oavsett i vilken ordning ändringarna kommer fram.
+Because there is a delay, two people can take the same request almost at the same time. Then the one who was first wins. Every app works out the same winner, regardless of the order in which the changes arrive.
 
-Den som förlorade får en ruta i stil med: *"Anna tog ärendet före dig, så din ändring gäller inte. Ärendet är Pågår (Anna)."* Din ändring finns kvar i ärendets historik, markerad som avvisad, men den påverkar inte ärendet.
+The one who lost gets a box along the lines of: *"Anna took the request before you, so your change does not apply. The request is in progress (Anna)."* Your change stays in the request's history, marked as rejected, but it does not affect the request.
 
-### Utan nät
+### Offline
 
-Du kan fortsätta jobba som vanligt. Ändringarna sparas på din dator och skickas när nätet är tillbaka. Med GitHub visar statusraden "Ingen kontakt med GitHub, visar sparad data" och hur många ändringar som väntar på att skickas.
+You can keep working as usual. Changes are saved on your computer and sent when the network is back. With GitHub the status bar shows "No contact with GitHub, showing saved data" and how many changes are waiting to be sent.
 
-Med en delad mapp: om själva mappen försvinner (t.ex. om Google Drive inte är igång) visar statusraden "Mappen hittas inte, visar sparad data". Då kan du läsa allt som redan synkats, men inte göra ändringar förrän mappen är tillbaka.
+With a shared folder: if the folder itself disappears (e.g. if Google Drive is not running) the status bar shows "Folder not found, showing saved data". Then you can read everything that has already synced, but not make changes until the folder is back.
 
-### Rör aldrig filerna i `ops/`
+### Never touch the files in `ops/`
 
-I repot (eller den delade mappen) finns en mapp `ops/` med en liten fil för varje händelse (skapad förfrågan, taget ärende osv.). **Redigera, flytta eller radera aldrig de filerna för hand.** Hela listan räknas fram från dem, och appen själv ändrar eller raderar aldrig en fil som redan finns. Tar du bort en fil kan ärenden försvinna eller byta status hos alla.
+The repository (or the shared folder) has a folder `ops/` with one small file per event (request created, request taken and so on). **Never edit, move or delete those files by hand.** The whole list is derived from them, and the app itself never changes or deletes a file that already exists. If you remove a file, requests can disappear or change status for everyone.
 
-Det går heller inte att redigera en förfrågan i efterhand. Blev något fel: avbryt ärendet och lägg upp ett nytt.
+A request cannot be edited afterwards either. If something went wrong: cancel the request and add a new one.
 
-### Säkerhetskopia
+### Backup
 
-- **GitHub:** repot har full historik. Varje händelse är en egen commit, så ingenting försvinner av misstag.
-- **Delad mapp:** Google Drive sparar versionshistorik och har en papperskorg. Zippa gärna hela mappen då och då och spara den någon annanstans.
+- **GitHub:** the repository has full history. Every event is its own commit, so nothing disappears by mistake.
+- **Shared folder:** Google Drive keeps version history and has a bin. Feel free to zip the whole folder now and then and keep it somewhere else.
 
-### Om något ser konstigt ut
+### If something looks odd
 
-Under **Inställningar → Diagnostik** ser du antal händelser, senaste synk, hur många ändringar som väntar på att skickas, filer som inte gick att läsa och händelser som avvisats. Knappen **Bygg om cachen** tömmer appens lokala databas och läser in allt igen. Det är ofarligt: databasen är bara en kopia.
+Under **Settings → Diagnostics** you can see the number of events, the last sync, how many changes are waiting to be sent, files that could not be read and events that were rejected. The **Rebuild cache** button empties the app's local database and reads everything again. It is harmless: the database is only a copy.
 
-Visas "GitHub nekade åtkomst" har teamnyckeln troligen gått ut. Be den som satte upp repot om en ny och klistra in den under Inställningar.
+If you see "GitHub denied access", the team key has probably expired. Ask whoever set up the repository for a new one and paste it under Settings.
 
-Visas "Ny version av appen finns" eller "Uppdatera appen" har någon i laget en nyare version. Ladda ner den senaste från Releases.
+If you see "A new version of the app is available" or "Update the app", someone on the team has a newer version. Download the latest from Releases.
 
-## För utvecklare
+## For developers
 
-Appen är skriven i Rust med [egui](https://github.com/emilk/egui). SQLite är inbyggt i binären.
+The app is written in Rust with [egui](https://github.com/emilk/egui). SQLite is built into the binary.
 
 ```bash
 cargo run --release
@@ -144,25 +152,31 @@ cargo run --release
 cargo test
 ```
 
-Flera instanser på samma dator (för test) startas med var sin konfigurationsmapp:
+Several instances on the same computer (for testing) are started with a configuration folder each:
 
 ```bash
 cargo run --release -- --config-dir /tmp/simq-a
 ```
 
-En ny release byggs automatiskt för Windows, macOS och Linux när en tagg som börjar på `v` pushas:
+A new release is built automatically for Windows, macOS and Linux when a tag starting with `v` is pushed:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-Lägg appens källkod i ett annat repo än lagets data, och lägg aldrig teamnyckeln i källkoden.
+The app icon is drawn by a script. To change it, edit `tools/make_icon.py` and run it (requires Pillow):
 
-### Hur synken fungerar
+```bash
+python3 tools/make_icon.py
+```
 
-- Varje ändring är en ny fil: `ops/ÅÅÅÅ-MM/<tid>-<räknare>_<klient>_<id>.json`. Inga filer skrivs över, så det kan aldrig bli konflikter i innehållet.
-- Varje app spelar upp alla händelser i en fast ordning (hybrid logical clock, sedan klient-ID och händelse-ID) och bygger sin egen lokala SQLite-cache. Samma filer ger alltid samma resultat.
-- Med GitHub arbetar appen mot en lokal kopia av `ops/` och en bakgrundstråd håller kopian och repot lika via GitHubs REST-API: nya filer i repot laddas ner, nya lokala filer laddas upp som en commit var. Teamnyckeln sparas i klartext i appens inställningsfil på datorn.
-- Allt som kommer utifrån behandlas som otrustad indata: filer över 64 KiB, trasig JSON, okända fält och filer med fel namn eller sökväg ignoreras. Bara `http://`- och `https://`-länkar går att klicka på.
+Keep the app's source code in a different repository from the team's data, and never put the team key in the source code.
 
-Koden ligger i `src/`: `model` (typer), `hlc` (klocka), `ops` (filformat), `replay` (statusmaskin), `store` (cache), `sync` (mappläsning och bakgrundstråd), `github` (synk mot repo), `config`, `i18n` (svenska/engelska) och `ui`.
+### How the sync works
+
+- Every change is a new file: `ops/YYYY-MM/<time>-<counter>_<client>_<id>.json`. No files are overwritten, so the content can never conflict.
+- Every app replays all events in a fixed order (hybrid logical clock, then client ID and event ID) and builds its own local SQLite cache. The same files always give the same result.
+- With GitHub the app works against a local copy of `ops/`, and a background thread keeps the copy and the repository equal through the GitHub REST API: new files in the repository are downloaded, new local files are uploaded as one commit each. The team key is stored in plain text in the app's settings file on the computer.
+- Everything coming from outside is treated as untrusted input: files over 64 KiB, broken JSON, unknown fields and files with the wrong name or path are ignored. Only `http://` and `https://` links can be clicked.
+
+The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `config`, `i18n` (Swedish/English), `theme` (look and feel) and `ui`.

@@ -1,4 +1,4 @@
-// Inget konsolfönster på Windows i release-byggen.
+// No console window on Windows in release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use anyhow::{anyhow, Context};
@@ -56,7 +56,10 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("SimQ")
             .with_inner_size([1180.0, 720.0])
-            .with_min_inner_size([820.0, 480.0]),
+            .with_min_inner_size([820.0, 480.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(simq::theme::ICON_PNG).unwrap_or_default(),
+            ),
         ..Default::default()
     };
     eframe::run_native(

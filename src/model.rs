@@ -1,4 +1,4 @@
-//! Domänmodell: status, platstyper och det härledda ärendet.
+//! Domain model: status, location kinds and the derived request.
 
 use std::cmp::Ordering;
 
@@ -30,7 +30,7 @@ impl Status {
         }
     }
 
-    /// Svensk benämning i gränssnittet.
+    /// Name shown in the user interface.
     pub fn label(self) -> &'static str {
         match self {
             Status::Queued => t("Köad", "Queued"),
@@ -80,7 +80,7 @@ impl OpKind {
         })
     }
 
-    /// "Anna {…}" – används i historiken.
+    /// "Anna {…}" – used in the history.
     pub fn label(self) -> &'static str {
         match self {
             OpKind::Create => t("Skapade ärendet", "Created the request"),
@@ -95,7 +95,7 @@ impl OpKind {
         }
     }
 
-    /// "Anna {…} före dig" – används i dialogen när någon hann före.
+    /// "Anna {…} before you" – used in the dialog when someone got there first.
     pub fn verb(self) -> &'static str {
         match self {
             OpKind::Create => t("skapade ärendet", "created the request"),
@@ -172,16 +172,16 @@ impl LocKind {
     }
 }
 
-/// En plats för en fil: typ + värde.
+/// A location for a file: kind + value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub kind: LocKind,
     pub value: String,
 }
 
-/// Sant bara för länkar som får öppnas i webbläsaren: http:// eller https://,
-/// utan blanksteg eller styrtecken. Alla andra scheman (file:, javascript: …)
-/// ger falskt.
+/// True only for links that may be opened in the browser: http:// or https://,
+/// without whitespace or control characters. All other schemes (file:, javascript: …)
+/// give false.
 pub fn is_http_url(s: &str) -> bool {
     let rest = if let Some(rest) = strip_prefix_ignore_case(s, "https://") {
         rest
@@ -206,8 +206,8 @@ pub fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Validerar ett par (typ, värde) så som det står i en händelsefil.
-/// Tomt värde betyder "ingen plats angiven".
+/// Validates a pair (kind, value) as it appears in an event file.
+/// An empty value means "no location given".
 pub fn parse_location(kind: &str, value: &str) -> Result<Option<Location>, String> {
     if char_len(value) > MAX_TEXT {
         return Err(t(
@@ -247,7 +247,7 @@ pub fn parse_location(kind: &str, value: &str) -> Result<Option<Location>, Strin
     }))
 }
 
-/// Tom sträng eller ett giltigt datum på formen ÅÅÅÅ-MM-DD.
+/// Empty string or a valid date of the form YYYY-MM-DD.
 pub fn valid_deadline(s: &str) -> bool {
     s.is_empty() || (s.len() == 10 && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
 }
@@ -271,26 +271,26 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Text från delade filer visas alltid som ren text. För enradiga fält byts
-/// styrtecken (radbrytningar m.m.) mot blanksteg.
+/// Text from shared files is always shown as plain text. For single-line fields,
+/// control characters (line breaks etc.) are replaced with spaces.
 pub fn one_line(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
 
-/// Flerradig text: behåll radbrytningar, ta bort övriga styrtecken.
+/// Multi-line text: keep line breaks, remove other control characters.
 pub fn clean_text(s: &str) -> String {
     s.chars()
         .filter(|&c| c == '\n' || !c.is_control())
         .collect()
 }
 
-/// Det härledda ärendet, så som det ser ut efter uppspelning av händelserna.
+/// The derived request, as it looks after replaying the events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub request_id: Uuid,
-    /// Löpnummer i den ordning ärendena skapades (enligt den totala ordningen).
+    /// Sequence number in the order the requests were created (by the total order).
     pub seq: u32,
     pub title: String,
     pub description: String,
@@ -308,13 +308,13 @@ pub struct Request {
     pub results: Option<Location>,
     pub summary: String,
     pub note: String,
-    /// Vem som senast ändrade ärendet, och hur.
+    /// Who last changed the request, and how.
     pub last_by: String,
     pub last_kind: OpKind,
 }
 
-/// Listans sortering: pågående först, sedan köade efter prioritet och äldst
-/// först, sist avslutade med senaste först.
+/// List order: in progress first, then queued by priority and oldest
+/// first, finally finished ones with the latest first.
 pub fn list_order(a: &Request, b: &Request) -> Ordering {
     fn group(r: &Request) -> u8 {
         match r.status {

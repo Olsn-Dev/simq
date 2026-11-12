@@ -1,14 +1,14 @@
-//! SimQ – kö/tracker för simuleringsförfrågor.
+//! SimQ – a queue/tracker for simulation requests.
 //!
-//! All logik ligger i biblioteket så att den kan testas utan gränssnitt:
-//! - `model`  – domäntyper (status, platstyper, härlett ärende)
+//! All logic lives in the library so that it can be tested without a user interface:
+//! - `model`  – domain types (status, location kinds, derived request)
 //! - `hlc`    – hybrid logical clock
-//! - `ops`    – händelseformatet samt läsning/skrivning av filer i den delade mappen
-//! - `replay` – den deterministiska statusmaskinen
-//! - `store`  – lokal SQLite-cache
-//! - `sync`   – mappläsning, inskick av egna händelser och bakgrundstråden
-//! - `config` – lokal konfiguration och identitet
-//! - `ui`     – egui-gränssnittet
+//! - `ops`    – the event format and reading/writing files in the shared folder
+//! - `replay` – the deterministic state machine
+//! - `store`  – local SQLite cache
+//! - `sync`   – folder reading, submitting own events and the background thread
+//! - `config` – local configuration and identity
+//! - `ui`     – the egui user interface
 
 pub mod config;
 pub mod github;
@@ -19,6 +19,7 @@ pub mod ops;
 pub mod replay;
 pub mod store;
 pub mod sync;
+pub mod theme;
 pub mod ui;
 
 #[cfg(test)]

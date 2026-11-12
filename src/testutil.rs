@@ -1,4 +1,4 @@
-//! Hjälpmedel för testerna.
+//! Helpers for the tests.
 
 use std::path::{Path, PathBuf};
 
@@ -8,13 +8,13 @@ use crate::hlc::Hlc;
 use crate::model::{LocKind, Location};
 use crate::ops::{build_op, NewAction, Op};
 
-/// Temporär mapp som tas bort när den släpps.
+/// Temporary folder that is removed when dropped.
 pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new() -> Self {
         let path = std::env::temp_dir().join(format!("simq-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("kan skapa tempmapp");
+        std::fs::create_dir_all(&path).expect("can create temp folder");
         TempDir(path)
     }
 
@@ -29,8 +29,8 @@ impl Drop for TempDir {
     }
 }
 
-/// Liten deterministisk slumpgenerator (xorshift) så att testerna inte behöver
-/// något extra beroende.
+/// Small deterministic random generator (xorshift) so that the tests do not need
+/// an extra dependency.
 pub struct Rng(u64);
 
 impl Rng {
@@ -95,7 +95,7 @@ pub fn finish_action(assignee: &str) -> NewAction {
     }
 }
 
-/// Bygger en händelse med en uttrycklig tidsstämpel.
+/// Builds an event with an explicit timestamp.
 pub fn op_at(
     client_id: Uuid,
     wall_ms: u64,
@@ -104,6 +104,5 @@ pub fn op_at(
     request_id: Uuid,
     action: &NewAction,
 ) -> Op {
-    build_op(client_id, Hlc { wall_ms, counter }, by, request_id, action)
-        .expect("giltig testhändelse")
+    build_op(client_id, Hlc { wall_ms, counter }, by, request_id, action).expect("valid test event")
 }

@@ -1,5 +1,5 @@
-//! Lokal konfiguration och identitet. Ligger i OS:ets konfigurationsmapp,
-//! aldrig i den delade mappen.
+//! Local configuration and identity. Lives in the OS configuration folder,
+//! never in the shared folder.
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +13,7 @@ use crate::i18n::{t, Lang};
 pub struct Config {
     #[serde(default)]
     pub sync_folder: Option<PathBuf>,
-    /// Satt när appen synkar mot ett GitHub-repo i stället för en delad mapp.
+    /// Set when the app syncs with a GitHub repository instead of a shared folder.
     #[serde(default)]
     pub github: Option<GithubConfig>,
     #[serde(default)]
@@ -34,14 +34,14 @@ impl Config {
         }
     }
 
-    /// Sant när första start-dialogen är avklarad.
+    /// True once the first-run dialog has been completed.
     pub fn is_complete(&self) -> bool {
         (self.sync_folder.is_some() || self.github.is_some())
             && !self.display_name.trim().is_empty()
     }
 
-    /// Mappen appen arbetar mot: den delade mappen, eller den lokala spegeln
-    /// av GitHub-repot.
+    /// The folder the app works against: the shared folder, or the local mirror
+    /// of the GitHub repository.
     pub fn effective_folder(&self, paths: &Paths) -> Option<PathBuf> {
         match &self.github {
             Some(github) => Some(paths.mirror_folder(&github.repo)),
@@ -54,9 +54,9 @@ impl Config {
 pub struct Paths {
     pub config_file: PathBuf,
     pub cache_file: PathBuf,
-    /// Här ligger de lokala speglarna av GitHub-repon.
+    /// The local mirrors of GitHub repositories live here.
     pub mirror_root: PathBuf,
-    /// Inställningar från tiden då appen hette SimKö. Läses en gång om inga nya finns.
+    /// Settings from when the app was called SimKö. Read once if no new ones exist.
     pub legacy_config_file: Option<PathBuf>,
 }
 
@@ -83,7 +83,7 @@ pub enum ConfigError {
 }
 
 impl Paths {
-    /// En egen spegelmapp per repo, så att händelser aldrig blandas mellan repon.
+    /// One mirror folder per repository, so events are never mixed between repositories.
     pub fn mirror_folder(&self, repo: &str) -> PathBuf {
         let name: String = repo
             .chars()
@@ -99,8 +99,8 @@ impl Paths {
     }
 }
 
-/// Med `--config-dir` hamnar både inställningar och cache i den mappen, så att
-/// flera instanser kan köras på samma dator.
+/// With `--config-dir` both settings and cache end up in that folder, so that
+/// several instances can run on the same computer.
 pub fn resolve_paths(override_dir: Option<&Path>) -> Result<Paths, ConfigError> {
     if let Some(dir) = override_dir {
         return Ok(Paths {
@@ -120,8 +120,8 @@ pub fn resolve_paths(override_dir: Option<&Path>) -> Result<Paths, ConfigError> 
     })
 }
 
-/// Läser konfigurationen. Saknas den (första start) eller går den inte att
-/// tolka skapas en ny med ett nytt client_id.
+/// Reads the configuration. If it is missing (first run) or cannot be
+/// parsed, a new one is created with a new client_id.
 pub fn load_or_init(paths: &Paths) -> Result<Config, ConfigError> {
     if let Ok(text) = std::fs::read_to_string(&paths.config_file) {
         if let Ok(config) = serde_json::from_str::<Config>(&text) {
@@ -156,8 +156,8 @@ pub struct CliArgs {
     pub version: bool,
 }
 
-/// Tolkar kommandoraden. Okända argument ignoreras (operativsystemet kan
-/// skicka med egna när appen startas från skrivbordet).
+/// Parses the command line. Unknown arguments are ignored (the operating system
+/// may add its own when the app is started from the desktop).
 pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, String> {
     let mut out = CliArgs::default();
     while let Some(arg) = args.next() {
@@ -236,7 +236,7 @@ mod tests {
         save(&paths, &config).unwrap();
         assert_eq!(load_or_init(&paths).unwrap().language, Lang::En);
 
-        // En konfiguration från före språkvalet saknar fältet: svenska gäller.
+        // A configuration from before the language choice lacks the field: Swedish applies.
         let old = format!(
             "{{\"display_name\": \"Bo\", \"client_id\": \"{}\"}}",
             config.client_id

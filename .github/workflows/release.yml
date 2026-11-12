@@ -1,6 +1,6 @@
 name: Release
 
-# Bygger release-binärer när en tagg som börjar på "v" pushas, t.ex. v0.1.0.
+# Builds release binaries when a tag starting with "v" is pushed, e.g. v0.1.0.
 on:
   push:
     tags:
@@ -14,7 +14,7 @@ env:
 
 jobs:
   build:
-    name: Bygg ${{ matrix.name }}
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -31,22 +31,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cacha cargo
+      - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Systempaket (Linux)
+      - name: System packages (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
-      - name: Tester
+      - name: Tests
         run: cargo test --locked
 
-      - name: Bygg
+      - name: Build
         run: cargo build --release --locked
 
-      - name: Paketera (Windows)
+      - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -55,12 +55,13 @@ jobs:
           Copy-Item README.md dist/SimQ/
           Compress-Archive -Path dist/SimQ -DestinationPath "simq-${{ github.ref_name }}-${{ matrix.name }}.zip"
 
-      - name: Paketera (macOS)
+      - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           APP=dist/SimQ.app
           VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp assets/SimQ.icns "$APP/Contents/Resources/SimQ.icns"
           cp target/release/simq "$APP/Contents/MacOS/simq"
           cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -71,6 +72,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>SimQ</string>
             <key>CFBundleIdentifier</key><string>se.simq.SimQ</string>
             <key>CFBundleExecutable</key><string>simq</string>
+            <key>CFBundleIconFile</key><string>SimQ</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleVersion</key><string>${VERSION}</string>
@@ -79,9 +81,9 @@ jobs:
           </dict>
           </plist>
           EOF
-          # Ad hoc-signering (ingen utvecklarlicens): krävs för att appen ska kunna starta på Apple Silicon.
+          # Ad hoc signing (no developer licence): required for the app to start on Apple Silicon.
           codesign --force --deep --sign - "$APP"
-          # Skivavbild med appen och en genväg till Program, så att man kan dra dit den.
+          # Disk image with the app and a shortcut to Applications, so it can be dragged there.
           mkdir dmg
           cp -R "$APP" dmg/
           cp README.md dmg/
@@ -89,14 +91,14 @@ jobs:
           hdiutil create -volname "SimQ" -srcfolder dmg -ov -format UDZO \
             "simq-${GITHUB_REF_NAME}-${{ matrix.name }}.dmg"
 
-      - name: Paketera (Linux)
+      - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist/simq
           cp target/release/simq README.md dist/simq/
           tar -czf "simq-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C dist simq
 
-      - name: Bifoga till GitHub Release
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |

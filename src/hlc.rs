@@ -1,15 +1,15 @@
 //! Hybrid logical clock (HLC).
 //!
-//! Varje app håller ett par (wall_ms, counter). Klockan är monoton även om
-//! systemklockan hoppar bakåt, och flyttas fram när främmande händelser läses in.
+//! Every app keeps a pair (wall_ms, counter). The clock is monotonic even if
+//! the system clock jumps backwards, and moves forward when foreign events are read.
 
 use serde::{Deserialize, Serialize};
 
-/// Främmande tider som ligger längre fram än så här jämfört med den lokala
-/// systemklockan får inte flytta fram den lokala klockan.
+/// Foreign times further ahead than this compared to the local system clock
+/// must not move the local clock forward.
 pub const MAX_FUTURE_DRIFT_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Räknaren skrivs med fyra siffror i filnamnet.
+/// The counter is written with four digits in the file name.
 pub const MAX_COUNTER: u32 = 9999;
 
 #[derive(
@@ -34,8 +34,8 @@ impl Clock {
         self.last
     }
 
-    /// Tidsstämpel för en ny lokal händelse. Alltid strikt större än alla
-    /// tidigare stämplar från den här klockan.
+    /// Timestamp for a new local event. Always strictly greater than all
+    /// earlier stamps from this clock.
     pub fn tick(&mut self, now_ms: u64) -> Hlc {
         let next = if now_ms > self.last.wall_ms {
             Hlc {
@@ -48,7 +48,7 @@ impl Clock {
                 counter: self.last.counter + 1,
             }
         } else {
-            // Räknaren får inte bli bredare än filnamnet tillåter.
+            // The counter must not become wider than the file name allows.
             Hlc {
                 wall_ms: self.last.wall_ms + 1,
                 counter: 0,
@@ -58,9 +58,9 @@ impl Clock {
         next
     }
 
-    /// Standard-HLC-merge med en främmande stämpel. Stämplar som ligger mer än
-    /// 24 timmar före den lokala systemklockan ignoreras här (händelsen spelas
-    /// ändå upp av anroparen).
+    /// Standard HLC merge with a foreign stamp. Stamps more than 24 hours ahead
+    /// of the local system clock are ignored here (the event is still replayed
+    /// by the caller).
     pub fn observe(&mut self, remote: Hlc, now_ms: u64) {
         if remote.wall_ms > now_ms.saturating_add(MAX_FUTURE_DRIFT_MS) {
             return;
@@ -91,7 +91,7 @@ mod tests {
         let mut prev = clock.tick(times[0]);
         for &now in &times[1..] {
             let next = clock.tick(now);
-            assert!(next > prev, "{next:?} ska vara större än {prev:?}");
+            assert!(next > prev, "{next:?} should be greater than {prev:?}");
             prev = next;
         }
     }
@@ -140,7 +140,7 @@ mod tests {
         let mut clock = Clock::new();
         clock.tick(now);
 
-        // Främmande klocka ligger en timme före: nästa lokala stämpel hamnar efter den.
+        // The foreign clock is one hour ahead: the next local stamp lands after it.
         let remote = Hlc {
             wall_ms: now + 3_600_000,
             counter: 7,
@@ -156,7 +156,7 @@ mod tests {
             }
         );
 
-        // Äldre främmande stämplar backar aldrig klockan.
+        // Older foreign stamps never move the clock backwards.
         clock.observe(
             Hlc {
                 wall_ms: 5,
@@ -182,7 +182,7 @@ mod tests {
         let next = clock.tick(now + 1);
         assert_eq!(next.wall_ms, now + 1);
 
-        // Precis på gränsen accepteras.
+        // Exactly on the limit is accepted.
         let edge = Hlc {
             wall_ms: now + MAX_FUTURE_DRIFT_MS,
             counter: 0,
