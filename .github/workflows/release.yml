@@ -81,8 +81,13 @@ jobs:
           EOF
           # Ad hoc-signering (ingen utvecklarlicens): krävs för att appen ska kunna starta på Apple Silicon.
           codesign --force --deep --sign - "$APP"
-          cp README.md dist/
-          tar -czf "simq-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C dist SimQ.app README.md
+          # Skivavbild med appen och en genväg till Program, så att man kan dra dit den.
+          mkdir dmg
+          cp -R "$APP" dmg/
+          cp README.md dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "SimQ" -srcfolder dmg -ov -format UDZO \
+            "simq-${GITHUB_REF_NAME}-${{ matrix.name }}.dmg"
 
       - name: Paketera (Linux)
         if: runner.os == 'Linux'
@@ -97,3 +102,4 @@ jobs:
           files: |
             simq-*.zip
             simq-*.tar.gz
+            simq-*.dmg

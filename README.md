@@ -74,7 +74,7 @@ Tips: lägger du en textfil som heter `simq-teamkey.txt` med teamnyckeln i samma
 Hämta den senaste versionen för ditt system under **Releases** på GitHub-sidan och packa upp:
 
 - **Windows:** packa upp zip-filen och dubbelklicka på `SimQ.exe`.
-- **macOS:** packa upp `tar.gz`-filen och dra `SimQ.app` till Program.
+- **macOS:** öppna `.dmg`-filen och dra `SimQ` till Program.
 - **Linux:** packa upp `tar.gz`-filen och kör `./simq`.
 
 Appen är en enda fristående fil. Ingenting behöver installeras.
