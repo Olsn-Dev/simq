@@ -66,6 +66,9 @@ pub enum Action {
         note: String,
     },
     Requeue,
+    Delete {
+        note: String,
+    },
     /// Unknown `kind` or a higher `v` than the app knows: stored but has no effect.
     Unsupported,
     /// Known `kind` but invalid content: rejected at replay with this reason.
@@ -261,6 +264,10 @@ fn parse_action(kind: &str, payload: Value) -> Action {
             Ok(Action::Cancel { note: w.note })
         }),
         OpKind::Requeue => from_payload::<EmptyWire>(payload).map(|_| Action::Requeue),
+        OpKind::Delete => from_payload::<NoteWire>(payload).and_then(|w| {
+            check_text(t("anteckning", "note"), &w.note, MAX_TEXT, false)?;
+            Ok(Action::Delete { note: w.note })
+        }),
     };
     result.unwrap_or_else(|e| Action::Invalid(truncate_chars(&e, 300)))
 }
@@ -366,6 +373,10 @@ pub enum NewAction {
         note: String,
     },
     Requeue,
+    /// Hides the request for everyone. Cannot be undone.
+    Delete {
+        note: String,
+    },
 }
 
 fn loc_wire(loc: &Option<Location>) -> (&str, &str) {
@@ -384,6 +395,7 @@ impl NewAction {
             NewAction::Fail { .. } => OpKind::Fail,
             NewAction::Cancel { .. } => OpKind::Cancel,
             NewAction::Requeue => OpKind::Requeue,
+            NewAction::Delete { .. } => OpKind::Delete,
         }
     }
 
@@ -428,7 +440,9 @@ impl NewAction {
                     "summary": summary,
                 })
             }
-            NewAction::Fail { note } | NewAction::Cancel { note } => json!({ "note": note }),
+            NewAction::Fail { note } | NewAction::Cancel { note } | NewAction::Delete { note } => {
+                json!({ "note": note })
+            }
             NewAction::Requeue => json!({}),
         }
     }

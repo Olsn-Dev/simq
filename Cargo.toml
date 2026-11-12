@@ -1,6 +1,6 @@
 [package]
 name = "simq"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "SimQ – a queue and tracker for simulation requests in a Formula Student team"
 license = "MIT"
@@ -26,6 +26,7 @@ rfd = "0.15"
 thiserror = "1"
 anyhow = "1"
 ureq = "2"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

@@ -99,10 +99,20 @@ pub struct DiagFile {
     pub error: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedRequest {
+    pub seq: u32,
+    pub title: String,
+    pub by: String,
+    pub at_ms: u64,
+}
+
 /// Everything the user interface needs, as an immutable snapshot.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub requests: Vec<Request>,
+    /// Requests that have been deleted (shown under diagnostics only).
+    pub deleted: Vec<DeletedRequest>,
     pub history: HashMap<Uuid, Vec<HistoryEntry>>,
     pub status: FolderStatus,
     pub last_sync_ms: Option<u64>,
@@ -426,16 +436,20 @@ impl Client {
         let headline = t("Någon hann före", "Someone got there first");
         let mut title = headline.to_string();
         if let Some(request) = request {
-            if is_en() {
-                text.push_str(&format!(
-                    " The request is {}",
-                    request.status.label().to_lowercase()
-                ));
+            if request.deleted_at.is_some() {
+                text.push_str(t(" Ärendet är borttaget", " The request has been deleted"));
             } else {
-                text.push_str(&format!(" Ärendet är {}", request.status.label()));
-            }
-            if !request.assignee.trim().is_empty() {
-                text.push_str(&format!(" ({})", one_line(&request.assignee)));
+                if is_en() {
+                    text.push_str(&format!(
+                        " The request is {}",
+                        request.status.label().to_lowercase()
+                    ));
+                } else {
+                    text.push_str(&format!(" Ärendet är {}", request.status.label()));
+                }
+                if !request.assignee.trim().is_empty() {
+                    text.push_str(&format!(" ({})", one_line(&request.assignee)));
+                }
             }
             text.push('.');
             title = format!(
@@ -476,8 +490,27 @@ impl Client {
 
     pub fn snapshot(&self) -> Snapshot {
         let state = self.store.state();
-        let mut requests: Vec<Request> = state.requests.values().cloned().collect();
+        // Deleted requests are hidden from the list but listed under diagnostics.
+        let mut requests: Vec<Request> = state
+            .requests
+            .values()
+            .filter(|r| r.deleted_at.is_none())
+            .cloned()
+            .collect();
         requests.sort_by_key(|r| r.seq);
+        let mut deleted: Vec<DeletedRequest> = state
+            .requests
+            .values()
+            .filter_map(|r| {
+                r.deleted_at.map(|at_ms| DeletedRequest {
+                    seq: r.seq,
+                    title: r.title.clone(),
+                    by: r.last_by.clone(),
+                    at_ms,
+                })
+            })
+            .collect();
+        deleted.sort_by_key(|d| d.at_ms);
 
         let mut history: HashMap<Uuid, Vec<HistoryEntry>> = HashMap::new();
         let mut rejected_ops = Vec::new();
@@ -550,6 +583,7 @@ impl Client {
 
         Snapshot {
             requests,
+            deleted,
             history,
             status: self.status.clone(),
             last_sync_ms: self.last_sync_ms,
@@ -1461,5 +1495,56 @@ mod tests {
             assert!(Instant::now() < deadline, "the snapshot was not updated");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn deleted_requests_disappear_for_everyone() {
+        let (dir_a, dir_b) = (TempDir::new(), TempDir::new());
+        let mut a = client(dir_a.path(), "Anna");
+        let mut b = client(dir_b.path(), "Bo");
+        let id = applied(a.submit(None, &create_action("Upright")));
+        let keep = applied(a.submit(None, &create_action("Aero")));
+        deliver(dir_a.path(), dir_b.path());
+        b.sync();
+
+        // Anna deletes the request. Bo, who has not synced yet, takes it.
+        applied(a.submit(
+            Some(id),
+            &NewAction::Delete {
+                note: "Dubblett".to_string(),
+            },
+        ));
+        std::thread::sleep(Duration::from_millis(5));
+        applied(b.submit(Some(id), &take_action("Bo")));
+        assert_eq!(b.snapshot().requests.len(), 2);
+
+        deliver(dir_a.path(), dir_b.path());
+        deliver(dir_b.path(), dir_a.path());
+        a.sync();
+        let report = b.sync();
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(
+            report.conflicts[0].text,
+            "Anna tog bort ärendet före dig, så din ändring gäller inte. Ärendet är borttaget."
+        );
+
+        for member in [&a, &b] {
+            let snapshot = member.snapshot();
+            assert_eq!(snapshot.requests.len(), 1);
+            assert_eq!(snapshot.requests[0].request_id, keep);
+            assert_eq!(snapshot.deleted.len(), 1);
+            assert_eq!(snapshot.deleted[0].title, "Upright");
+            assert_eq!(snapshot.deleted[0].by, "Anna");
+        }
+        assert_eq!(a.state(), b.state());
+
+        // Nothing more can be done with a deleted request.
+        match a.submit(Some(id), &take_action("Anna")) {
+            Ok(Submitted::Rejected(notice)) => assert!(notice.text.contains("borttaget")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // The cache keeps the deletion across a rebuild.
+        a.rebuild().unwrap();
+        assert_eq!(a.snapshot().requests.len(), 1);
     }
 }

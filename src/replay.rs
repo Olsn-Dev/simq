@@ -23,6 +23,8 @@ pub enum Reject {
     WrongStatus(Status),
     /// The content of the event is invalid.
     Invalid(String),
+    /// The request has been deleted.
+    Deleted,
 }
 
 impl Reject {
@@ -37,6 +39,9 @@ impl Reject {
                 } else {
                     format!("Ärendet var redan {}", status.label())
                 }
+            }
+            Reject::Deleted => {
+                t("Ärendet var borttaget", "The request had been deleted").to_string()
             }
             Reject::Invalid(msg) => format!("{}: {msg}", t("Ogiltig händelse", "Invalid event")),
         }
@@ -138,6 +143,7 @@ impl State {
                         results: None,
                         summary: String::new(),
                         note: String::new(),
+                        deleted_at: None,
                         last_by: op.by.clone(),
                         last_kind: OpKind::Create,
                     };
@@ -204,6 +210,15 @@ impl State {
 fn transition(request: &mut Request, op: &Op) -> Outcome {
     let status = request.status;
     let at = op.hlc.wall_ms;
+    if request.deleted_at.is_some() {
+        return Outcome::Rejected {
+            reason: Reject::Deleted,
+            blocker: Some(Blocker {
+                by: request.last_by.clone(),
+                kind: request.last_kind,
+            }),
+        };
+    }
     let kind = match &op.action {
         Action::Take { assignee } if status == Status::Queued => {
             request.status = Status::Running;
@@ -231,6 +246,14 @@ fn transition(request: &mut Request, op: &Op) -> Outcome {
             request.note = note.clone();
             request.finished_at = Some(at);
             OpKind::Cancel
+        }
+        Action::Delete { note } => {
+            // Allowed from every status. The request keeps its status but is hidden.
+            request.deleted_at = Some(at);
+            if !note.trim().is_empty() {
+                request.note = note.clone();
+            }
+            OpKind::Delete
         }
         Action::Requeue if matches!(status, Status::Failed | Status::Cancelled) => {
             request.status = Status::Queued;
@@ -632,5 +655,75 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "the replay took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn delete_hides_the_request_and_blocks_later_events() {
+        let a = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let delete = |t: u64, by: &str| {
+            op_at(
+                a,
+                t,
+                0,
+                by,
+                id,
+                &NewAction::Delete {
+                    note: "Dubblett".to_string(),
+                },
+            )
+        };
+        let create = op_at(a, 1, 0, "Anna", id, &create_action("Upright"));
+        let take = op_at(a, 2, 0, "Bo", id, &take_action("Bo"));
+        let removed = delete(3, "Anna");
+        let finish = op_at(a, 4, 0, "Bo", id, &finish_action("Bo"));
+        let again = delete(5, "Cia");
+        let state = replay(vec![
+            again.clone(),
+            finish.clone(),
+            removed.clone(),
+            take.clone(),
+            create,
+        ]);
+
+        let request = &state.requests[&id];
+        assert_eq!(request.deleted_at, Some(3));
+        assert_eq!(request.status, Status::Running, "the status is kept");
+        assert_eq!(request.note, "Dubblett");
+        assert_eq!(request.last_by, "Anna");
+        assert_eq!(state.outcomes[&take.op_id], Outcome::Applied);
+        assert_eq!(state.outcomes[&removed.op_id], Outcome::Applied);
+        for op in [&finish, &again] {
+            assert_eq!(
+                state.outcomes[&op.op_id],
+                Outcome::Rejected {
+                    reason: Reject::Deleted,
+                    blocker: Some(Blocker {
+                        by: "Anna".to_string(),
+                        kind: OpKind::Delete
+                    }),
+                }
+            );
+        }
+
+        // Deleting works from every status, including done.
+        let other = Uuid::new_v4();
+        let ops = vec![
+            op_at(a, 1, 0, "Anna", other, &create_action("Aero")),
+            op_at(a, 2, 0, "Bo", other, &finish_action("Bo")),
+            op_at(
+                a,
+                3,
+                0,
+                "Anna",
+                other,
+                &NewAction::Delete {
+                    note: String::new(),
+                },
+            ),
+        ];
+        let state = replay(ops);
+        assert_eq!(state.requests[&other].status, Status::Done);
+        assert_eq!(state.requests[&other].deleted_at, Some(3));
     }
 }

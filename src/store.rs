@@ -21,7 +21,7 @@ use crate::model::{Location, Request};
 use crate::ops::Op;
 use crate::replay::{sort_ops, Outcome, State};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS requests (
     results_kind TEXT NOT NULL,
     results_ref  TEXT NOT NULL,
     summary      TEXT NOT NULL,
-    note         TEXT NOT NULL
+    note         TEXT NOT NULL,
+    deleted_at   INTEGER
 );
 CREATE TABLE IF NOT EXISTS op_result (
     op_id   TEXT PRIMARY KEY,
@@ -498,9 +499,9 @@ fn write_request(conn: &Connection, r: &Request) -> Result<(), StoreError> {
         "INSERT OR REPLACE INTO requests (
              request_id, seq, title, description, sim_type, priority, requester, deadline,
              input_kind, input_ref, status, assignee, created_at, started_at, finished_at,
-             report_kind, report_ref, results_kind, results_ref, summary, note)
+             report_kind, report_ref, results_kind, results_ref, summary, note, deleted_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19, ?20, ?21)",
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
     )?
     .execute(params![
         r.request_id.to_string(),
@@ -524,6 +525,7 @@ fn write_request(conn: &Connection, r: &Request) -> Result<(), StoreError> {
         results_ref,
         r.summary,
         r.note,
+        r.deleted_at.map(millis),
     ])?;
     Ok(())
 }

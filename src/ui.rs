@@ -22,6 +22,7 @@ use crate::ops::NewAction;
 use crate::store::SeenState;
 use crate::sync::{self, Client, Cmd, Event, FolderStatus, Handle, Notice, Snapshot, Source};
 use crate::theme;
+use crate::update;
 
 /// Suggested simulation types (Swedish, English).
 const SIM_TYPES: [(&str, &str); 8] = [
@@ -148,8 +149,16 @@ struct FinishForm {
 struct NoteForm {
     request_id: Uuid,
     title: String,
-    fail: bool,
+    kind: NoteKind,
     note: String,
+}
+
+/// What a note form does when submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteKind {
+    Fail,
+    Cancel,
+    Delete,
 }
 
 enum Form {
@@ -167,16 +176,13 @@ impl Form {
                 t("Markera klar", "Mark as done"),
                 truncate_chars(&one_line(&f.title), 40)
             ),
-            Form::Note(f) if f.fail => {
-                format!(
-                    "{}: {}",
-                    t("Markera misslyckad", "Mark as failed"),
-                    truncate_chars(&one_line(&f.title), 40)
-                )
-            }
             Form::Note(f) => format!(
                 "{}: {}",
-                t("Avbryt", "Cancel"),
+                match f.kind {
+                    NoteKind::Fail => t("Markera misslyckad", "Mark as failed"),
+                    NoteKind::Cancel => t("Avbryt", "Cancel"),
+                    NoteKind::Delete => t("Ta bort", "Delete"),
+                },
                 truncate_chars(&one_line(&f.title), 40)
             ),
         }
@@ -186,8 +192,11 @@ impl Form {
         match self {
             Form::New(_) => t("Lägg i kön", "Add to queue"),
             Form::Finish(_) => t("Markera klar", "Mark as done"),
-            Form::Note(f) if f.fail => t("Markera misslyckad", "Mark as failed"),
-            Form::Note(_) => t("Avbryt ärendet", "Cancel the request"),
+            Form::Note(f) => match f.kind {
+                NoteKind::Fail => t("Markera misslyckad", "Mark as failed"),
+                NoteKind::Cancel => t("Avbryt ärendet", "Cancel the request"),
+                NoteKind::Delete => t("Ta bort ärendet", "Delete the request"),
+            },
         }
     }
 
@@ -257,10 +266,10 @@ impl Form {
             ),
             Form::Note(f) => {
                 let note = f.note.trim().to_string();
-                let action = if f.fail {
-                    NewAction::Fail { note }
-                } else {
-                    NewAction::Cancel { note }
+                let action = match f.kind {
+                    NoteKind::Fail => NewAction::Fail { note },
+                    NoteKind::Cancel => NewAction::Cancel { note },
+                    NoteKind::Delete => NewAction::Delete { note },
                 };
                 (Some(f.request_id), action)
             }
@@ -286,8 +295,26 @@ enum UiAction {
     Take(Uuid),
     Requeue(Uuid),
     OpenFinish(Uuid),
-    OpenNote(Uuid, bool),
+    OpenNote(Uuid, NoteKind),
     OpenUrl(String),
+}
+
+/// Where the in-app update stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(update::Available),
+    Installing(String),
+    /// The new version is in place and takes effect after a restart.
+    Installed(String),
+    Failed(String),
+}
+
+enum UpdateMsg {
+    Checked(Result<update::Check, String>),
+    Installed(Result<String, String>),
 }
 
 pub struct App {
@@ -311,6 +338,10 @@ pub struct App {
     next_token: u64,
     was_focused: bool,
     logo: Option<egui::TextureHandle>,
+    update: UpdateState,
+    update_rx: Option<Receiver<UpdateMsg>>,
+    /// True if the user asked for the check (then errors are shown).
+    update_manual: bool,
 }
 
 impl App {
@@ -346,7 +377,7 @@ impl App {
             error: None,
             saved: false,
         };
-        Ok(App {
+        let mut app = App {
             handle,
             config,
             paths,
@@ -367,7 +398,176 @@ impl App {
             next_token: 1,
             was_focused: false,
             logo,
-        })
+            update: UpdateState::Idle,
+            update_rx: None,
+            update_manual: false,
+        };
+        // Look for a newer version once at start-up.
+        app.check_for_update(false);
+        Ok(app)
+    }
+
+    fn team_token(&self) -> Option<String> {
+        self.config.github.as_ref().map(|g| g.token.clone())
+    }
+
+    /// Asks GitHub for a newer version in a background thread.
+    fn check_for_update(&mut self, manual: bool) {
+        if matches!(
+            self.update,
+            UpdateState::Checking | UpdateState::Installing(_) | UpdateState::Installed(_)
+        ) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let token = self.team_token();
+        let spawned = std::thread::Builder::new()
+            .name("simq-update".to_string())
+            .spawn(move || {
+                let _ = tx.send(UpdateMsg::Checked(update::check(token.as_deref())));
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.update_rx = Some(rx);
+            self.update_manual = manual;
+            self.update = UpdateState::Checking;
+        }
+    }
+
+    /// Downloads and installs a newer version in a background thread.
+    fn install_update(&mut self, available: update::Available) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let token = self.team_token();
+        let version = available.version.clone();
+        let spawned = std::thread::Builder::new()
+            .name("simq-update".to_string())
+            .spawn(move || {
+                let result = update::download_and_install(&available, token.as_deref());
+                let _ = tx.send(UpdateMsg::Installed(result));
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.update_rx = Some(rx);
+            self.update_manual = true;
+            self.update = UpdateState::Installing(version);
+        }
+    }
+
+    fn restart_into_update(&mut self) {
+        match update::restart() {
+            Ok(()) => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(text) => self.notices.push_back(Notice {
+                title: t("Kunde inte starta om", "Could not restart").to_string(),
+                text: format!(
+                    "{} ({text})",
+                    t(
+                        "Stäng appen och starta den igen för att använda den nya versionen.",
+                        "Close the app and start it again to use the new version.",
+                    )
+                ),
+            }),
+        }
+    }
+
+    /// The update button in the top bar. Only visible when there is something to do.
+    fn update_button(&mut self, ui: &mut egui::Ui) {
+        match self.update.clone() {
+            UpdateState::Available(available) => {
+                let label = format!("{} {}", t("Uppdatera till", "Update to"), available.version);
+                if theme::add_primary(ui, true, &label).clicked() {
+                    self.install_update(available);
+                }
+            }
+            UpdateState::Installing(_) => {
+                ui.weak(t("Laddar ner uppdatering…", "Downloading update…"));
+                ui.spinner();
+            }
+            UpdateState::Installed(_) => {
+                let clicked = theme::add_primary(ui, true, t("Starta om", "Restart"))
+                    .on_hover_text(t(
+                        "Den nya versionen är installerad och används efter omstart.",
+                        "The new version is installed and is used after a restart.",
+                    ))
+                    .clicked();
+                if clicked {
+                    self.restart_into_update();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Version and update controls under Settings.
+    fn update_settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(RichText::new("Version").strong());
+        ui.horizontal(|ui| {
+            ui.label(format!("SimQ {}", update::current_version()));
+            let busy = matches!(
+                self.update,
+                UpdateState::Checking | UpdateState::Installing(_)
+            );
+            if !matches!(self.update, UpdateState::Installed(_))
+                && ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(t("Sök efter uppdatering", "Check for updates")),
+                    )
+                    .clicked()
+            {
+                self.check_for_update(true);
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+        match self.update.clone() {
+            UpdateState::Idle => {}
+            UpdateState::Checking => {
+                ui.weak(t("Söker…", "Checking…"));
+            }
+            UpdateState::UpToDate => {
+                ui.weak(t(
+                    "Du har den senaste versionen.",
+                    "You have the latest version.",
+                ));
+            }
+            UpdateState::Available(available) => {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Version {} {}",
+                        available.version,
+                        t("finns.", "is available.")
+                    ));
+                    if theme::add_primary(ui, true, t("Uppdatera", "Update")).clicked() {
+                        self.install_update(available);
+                    }
+                });
+            }
+            UpdateState::Installing(version) => {
+                ui.weak(format!(
+                    "{} {version}…",
+                    t("Laddar ner version", "Downloading version")
+                ));
+            }
+            UpdateState::Installed(version) => {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Version {version} {}",
+                        t("är installerad.", "is installed.")
+                    ));
+                    if theme::add_primary(ui, true, t("Starta om", "Restart")).clicked() {
+                        self.restart_into_update();
+                    }
+                });
+            }
+            UpdateState::Failed(text) => {
+                ui.colored_label(ui.visuals().error_fg_color, text);
+            }
+        }
     }
 
     fn token(&mut self) -> u64 {
@@ -455,6 +655,42 @@ impl App {
             }
         }
         self.snapshot = self.handle.snapshot();
+
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(UpdateMsg::Checked(result)) => {
+                    self.update_rx = None;
+                    self.update = match result {
+                        Ok(update::Check::UpToDate) => UpdateState::UpToDate,
+                        Ok(update::Check::Available(available)) => {
+                            UpdateState::Available(available)
+                        }
+                        // A failed automatic check at start-up is not worth a message.
+                        Err(text) if self.update_manual => UpdateState::Failed(text),
+                        Err(_) => UpdateState::Idle,
+                    };
+                }
+                Ok(UpdateMsg::Installed(result)) => {
+                    self.update_rx = None;
+                    self.update = match result {
+                        Ok(version) => UpdateState::Installed(version),
+                        Err(text) => {
+                            self.notices.push_back(Notice {
+                                title: t("Uppdateringen misslyckades", "The update failed")
+                                    .to_string(),
+                                text: text.clone(),
+                            });
+                            UpdateState::Failed(text)
+                        }
+                    };
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.update_rx = None;
+                    self.update = UpdateState::Idle;
+                }
+            }
+        }
 
         let focused = ctx.input(|i| i.focused);
         if focused && !self.was_focused {
@@ -765,6 +1001,7 @@ impl App {
                         if ui.button(t("Synka nu", "Sync now")).clicked() {
                             self.handle.send(Cmd::SyncNow);
                         }
+                        self.update_button(ui);
                     });
                 });
                 ui.add_space(6.0);
@@ -1113,9 +1350,7 @@ impl App {
                             ui.label(clean_text(&request.description));
                         }
 
-                        if request.status != Status::Done {
-                            ui.add_space(14.0);
-                        }
+                        ui.add_space(14.0);
                         ui.horizontal_wrapped(|ui| {
                             let button = |ui: &mut egui::Ui, label: &str| {
                                 ui.add_enabled(can_write, egui::Button::new(label))
@@ -1150,11 +1385,14 @@ impl App {
                             }
                             if request.status.is_active() {
                                 if button(ui, t("Misslyckad…", "Failed…")) {
-                                    actions.push(UiAction::OpenNote(id, true));
+                                    actions.push(UiAction::OpenNote(id, NoteKind::Fail));
                                 }
                                 if button(ui, t("Avbryt…", "Cancel…")) {
-                                    actions.push(UiAction::OpenNote(id, false));
+                                    actions.push(UiAction::OpenNote(id, NoteKind::Cancel));
                                 }
+                            }
+                            if button(ui, t("Ta bort…", "Delete…")) {
+                                actions.push(UiAction::OpenNote(id, NoteKind::Delete));
                             }
                         });
 
@@ -1300,6 +1538,7 @@ impl App {
                         if self.identity.folder != self.config.sync_folder {
                             ui.weak(t("När mappen byts läses allt in på nytt från den nya mappen.", "When the folder is changed, everything is read again from the new folder."));
                         }
+                        self.update_settings_ui(ui);
                     }
                     SettingsTab::Diagnostics => self.diagnostics_ui(ui, &snapshot),
                 }
@@ -1420,6 +1659,31 @@ impl App {
                 });
                 egui::CollapsingHeader::new(format!(
                     "{} ({})",
+                    t("Borttagna ärenden", "Deleted requests"),
+                    snapshot.deleted.len()
+                ))
+                .show(ui, |ui| {
+                    if snapshot.deleted.is_empty() {
+                        ui.weak(t("Inga", "None"));
+                    }
+                    for item in snapshot.deleted.iter().rev().take(300) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak(format_time(item.at_ms));
+                            ui.label(format!(
+                                "#{} {}",
+                                item.seq,
+                                truncate_chars(&one_line(&item.title), 60)
+                            ));
+                            ui.weak(format!(
+                                "({} {})",
+                                t("borttaget av", "deleted by"),
+                                one_line(&item.by)
+                            ));
+                        });
+                    }
+                });
+                egui::CollapsingHeader::new(format!(
+                    "{} ({})",
                     t("Avvisade händelser", "Rejected events"),
                     snapshot.rejected_ops.len()
                 ))
@@ -1506,7 +1770,7 @@ impl App {
                         }));
                     }
                 }
-                UiAction::OpenNote(id, fail) => {
+                UiAction::OpenNote(id, kind) => {
                     if let Some(request) =
                         self.snapshot.requests.iter().find(|r| r.request_id == id)
                     {
@@ -1514,7 +1778,7 @@ impl App {
                         self.form = Some(Form::Note(NoteForm {
                             request_id: id,
                             title: request.title.clone(),
-                            fail,
+                            kind,
                             note: String::new(),
                         }));
                     }
@@ -1879,28 +2143,37 @@ fn finish_form_ui(ui: &mut egui::Ui, f: &mut FinishForm) {
 }
 
 fn note_form_ui(ui: &mut egui::Ui, f: &mut NoteForm) {
-    ui.label(if f.fail {
-        t(
+    match f.kind {
+        NoteKind::Fail => ui.label(t(
             "Ärendet markeras som misslyckat. Det kan köas om senare.",
             "The request will be marked as failed. It can be requeued later.",
-        )
-    } else {
-        t(
+        )),
+        NoteKind::Cancel => ui.label(t(
             "Ärendet avbryts. Det kan köas om senare.",
             "The request will be cancelled. It can be requeued later.",
-        )
-    });
+        )),
+        NoteKind::Delete => ui.colored_label(
+            ui.visuals().warn_fg_color,
+            t(
+                "Ärendet tas bort för alla i laget. Det går inte att ångra.",
+                "The request will be deleted for everyone on the team. This cannot be undone.",
+            ),
+        ),
+    };
     ui.add_space(6.0);
     ui.label(RichText::new(t("Anteckning (valfri)", "Note (optional)")).strong());
     ui.add(
         egui::TextEdit::multiline(&mut f.note)
-            .hint_text(if f.fail {
-                t("Vad gick fel?", "What went wrong?")
-            } else {
-                t(
+            .hint_text(match f.kind {
+                NoteKind::Fail => t("Vad gick fel?", "What went wrong?"),
+                NoteKind::Cancel => t(
                     "Varför avbryts ärendet?",
                     "Why is the request being cancelled?",
-                )
+                ),
+                NoteKind::Delete => t(
+                    "Varför tas ärendet bort?",
+                    "Why is the request being deleted?",
+                ),
             })
             .char_limit(MAX_TEXT)
             .desired_rows(4)

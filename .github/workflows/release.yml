@@ -52,6 +52,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/SimQ | Out-Null
           Copy-Item target/release/simq.exe dist/SimQ/SimQ.exe
+          # The bare program, used by the in-app update.
+          Copy-Item target/release/simq.exe simq-windows-x64.exe
           Copy-Item README.md dist/SimQ/
           Compress-Archive -Path dist/SimQ -DestinationPath "simq-${{ github.ref_name }}-${{ matrix.name }}.zip"
 
@@ -63,6 +65,8 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp assets/SimQ.icns "$APP/Contents/Resources/SimQ.icns"
           cp target/release/simq "$APP/Contents/MacOS/simq"
+          # The bare program, used by the in-app update.
+          cp target/release/simq simq-macos-arm64
           cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -96,6 +100,8 @@ jobs:
         run: |
           mkdir -p dist/simq
           cp target/release/simq README.md dist/simq/
+          # The bare program, used by the in-app update.
+          cp target/release/simq simq-linux-x64
           tar -czf "simq-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C dist simq
 
       - name: Attach to GitHub Release
@@ -105,3 +111,6 @@ jobs:
             simq-*.zip
             simq-*.tar.gz
             simq-*.dmg
+            simq-windows-x64.exe
+            simq-macos-arm64
+            simq-linux-x64

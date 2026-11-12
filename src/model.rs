@@ -54,6 +54,7 @@ pub enum OpKind {
     Fail,
     Cancel,
     Requeue,
+    Delete,
 }
 
 impl OpKind {
@@ -65,6 +66,7 @@ impl OpKind {
             OpKind::Fail => "fail",
             OpKind::Cancel => "cancel",
             OpKind::Requeue => "requeue",
+            OpKind::Delete => "delete",
         }
     }
 
@@ -76,6 +78,7 @@ impl OpKind {
             "fail" => OpKind::Fail,
             "cancel" => OpKind::Cancel,
             "requeue" => OpKind::Requeue,
+            "delete" => OpKind::Delete,
             _ => return None,
         })
     }
@@ -92,6 +95,7 @@ impl OpKind {
             ),
             OpKind::Cancel => t("Avbröt ärendet", "Cancelled the request"),
             OpKind::Requeue => t("Köade om ärendet", "Requeued the request"),
+            OpKind::Delete => t("Tog bort ärendet", "Deleted the request"),
         }
     }
 
@@ -107,6 +111,7 @@ impl OpKind {
             ),
             OpKind::Cancel => t("avbröt ärendet", "cancelled the request"),
             OpKind::Requeue => t("köade om ärendet", "requeued the request"),
+            OpKind::Delete => t("tog bort ärendet", "deleted the request"),
         }
     }
 }
@@ -308,6 +313,9 @@ pub struct Request {
     pub results: Option<Location>,
     pub summary: String,
     pub note: String,
+    /// Set when the request has been deleted. It is then hidden from the list
+    /// and no further events apply to it.
+    pub deleted_at: Option<u64>,
     /// Who last changed the request, and how.
     pub last_by: String,
     pub last_kind: OpKind,

@@ -22,7 +22,7 @@
 - **Swedish and English.** Each person chooses their own language.
 - **A single file** for Windows, macOS and Linux. Nothing to install.
 
-**Contents:** [How it works](#how-it-works) · [Get started with GitHub](#get-started-with-github) · [Shared folder](#get-started-with-a-shared-folder-alternative) · [Download](#download-and-start) · [Good to know](#good-to-know) · [For developers](#for-developers)
+**Contents:** [How it works](#how-it-works) · [Get started with GitHub](#get-started-with-github) · [Shared folder](#get-started-with-a-shared-folder-alternative) · [Download](#download-and-start) · [Updating](#updating) · [Good to know](#good-to-know) · [For developers](#for-developers)
 
 SimQ does not run any simulations. You do the actual work as usual in Ansys, SolidWorks, Fusion or whatever you use. SimQ is only the queue and the notice board.
 
@@ -103,6 +103,12 @@ If it still does not work on macOS you can remove the quarantine flag in Termina
 xattr -dr com.apple.quarantine /Applications/SimQ.app
 ```
 
+## Updating
+
+The app looks for a newer version every time it starts. When there is one, an **Update to …** button appears at the top right. Click it, wait for the download, and click **Restart**. You can also look manually under **Settings → Check for updates**.
+
+The update is downloaded from this repository's Releases page. For that to work the repository must be public, or the team key must also be allowed to read it (Contents: Read-only). On macOS the app has to be in a folder you can write to, such as Applications, not opened straight from the disk image.
+
 ## Good to know
 
 ### It takes a moment before other people's changes show up
@@ -125,7 +131,13 @@ With a shared folder: if the folder itself disappears (e.g. if Google Drive is n
 
 The repository (or the shared folder) has a folder `ops/` with one small file per event (request created, request taken and so on). **Never edit, move or delete those files by hand.** The whole list is derived from them, and the app itself never changes or deletes a file that already exists. If you remove a file, requests can disappear or change status for everyone.
 
-A request cannot be edited afterwards either. If something went wrong: cancel the request and add a new one.
+A request cannot be edited afterwards either. If something went wrong: delete the request and add a new one.
+
+### Deleting a request
+
+Open the request and click **Delete…**. The request disappears from the list for everyone on the team, and this cannot be undone. Anyone with the team key can delete. Nothing is removed from the repository: the deletion is just another event, and deleted requests are listed under **Settings → Diagnostics**.
+
+Team members on a version older than 0.3.0 still see deleted requests until they update.
 
 ### Backup
 
@@ -179,4 +191,4 @@ Keep the app's source code in a different repository from the team's data, and n
 - With GitHub the app works against a local copy of `ops/`, and a background thread keeps the copy and the repository equal through the GitHub REST API: new files in the repository are downloaded, new local files are uploaded as one commit each. The team key is stored in plain text in the app's settings file on the computer.
 - Everything coming from outside is treated as untrusted input: files over 64 KiB, broken JSON, unknown fields and files with the wrong name or path are ignored. Only `http://` and `https://` links can be clicked.
 
-The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `config`, `i18n` (Swedish/English), `theme` (look and feel) and `ui`.
+The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui`.

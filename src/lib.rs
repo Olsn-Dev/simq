@@ -21,6 +21,7 @@ pub mod store;
 pub mod sync;
 pub mod theme;
 pub mod ui;
+pub mod update;
 
 #[cfg(test)]
 pub(crate) mod testutil;

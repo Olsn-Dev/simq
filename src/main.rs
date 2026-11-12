@@ -37,6 +37,7 @@ fn main() -> anyhow::Result<()> {
     let cfg = config::load_or_init(&paths)
         .context("kunde inte läsa inställningarna / could not read the settings")?;
     i18n::set(cfg.language);
+    simq::update::clean_up_after_update();
     let store = Store::open_or_recreate(&paths.cache_file).context(t(
         "kunde inte öppna den lokala cachen",
         "could not open the local cache",
