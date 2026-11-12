@@ -1,0 +1,33 @@
+[package]
+name = "simq"
+version = "0.1.0"
+edition = "2021"
+description = "SimQ – kö och tracker för simuleringsförfrågor i ett Formula Student-lag"
+license = "MIT"
+
+[lib]
+name = "simq"
+path = "src/lib.rs"
+
+[[bin]]
+name = "simq"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+egui_extras = "0.31"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = "0.4"
+directories = "5"
+rfd = "0.15"
+thiserror = "1"
+anyhow = "1"
+ureq = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
