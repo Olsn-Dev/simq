@@ -5,6 +5,8 @@
 //! - `ops`        – all events read so far (the file's text)
 //! - `seen_files` – which files have already been read, and how it went
 //! - `requests`   – derived requests
+//! - `comments`   – derived comments on requests
+//! - `departments`, `parts` – the derived car overview
 //! - `op_result`  – whether each event was applied or rejected, and why
 //! - `meta`       – which folder the cache belongs to
 
@@ -17,11 +19,11 @@ use uuid::Uuid;
 
 use crate::i18n::t;
 
-use crate::model::{Location, Request};
+use crate::model::{Department, Location, Part, Request};
 use crate::ops::Op;
 use crate::replay::{sort_ops, Outcome, State};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -65,7 +67,38 @@ CREATE TABLE IF NOT EXISTS requests (
     results_ref  TEXT NOT NULL,
     summary      TEXT NOT NULL,
     note         TEXT NOT NULL,
-    deleted_at   INTEGER
+    deleted_at   INTEGER,
+    department   TEXT NOT NULL,
+    part         TEXT NOT NULL,
+    changed_at   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS comments (
+    op_id      TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    at_ms      INTEGER NOT NULL,
+    by         TEXT NOT NULL,
+    text       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS departments (
+    id         TEXT PRIMARY KEY,
+    seq        INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    color      INTEGER NOT NULL,
+    zones      TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    changed_at INTEGER NOT NULL,
+    deleted_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS parts (
+    id         TEXT PRIMARY KEY,
+    seq        INTEGER NOT NULL,
+    department TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    note       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    changed_at INTEGER NOT NULL,
+    deleted_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS op_result (
     op_id   TEXT PRIMARY KEY,
@@ -187,7 +220,8 @@ impl Store {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS ops;
                  DROP TABLE IF EXISTS seen_files; DROP TABLE IF EXISTS requests;
-                 DROP TABLE IF EXISTS op_result;",
+                 DROP TABLE IF EXISTS op_result; DROP TABLE IF EXISTS comments;
+                 DROP TABLE IF EXISTS departments; DROP TABLE IF EXISTS parts;",
             )?;
         }
         conn.execute_batch(SCHEMA)?;
@@ -353,9 +387,15 @@ impl Store {
                     write_outcome(&tx, op_id, outcome)?;
                 }
             }
-            for request_id in &touched_requests {
-                if let Some(request) = self.state.requests.get(request_id) {
+            for id in &touched_requests {
+                if let Some(request) = self.state.requests.get(id) {
                     write_request(&tx, request)?;
+                }
+                if let Some(department) = self.state.departments.get(id) {
+                    write_department(&tx, department)?;
+                }
+                if let Some(part) = self.state.parts.get(id) {
+                    write_part(&tx, part)?;
                 }
             }
         }
@@ -395,7 +435,8 @@ impl Store {
         self.conn.execute_batch(
             "BEGIN;
              DELETE FROM ops; DELETE FROM seen_files;
-             DELETE FROM requests; DELETE FROM op_result;
+             DELETE FROM requests; DELETE FROM op_result; DELETE FROM comments;
+             DELETE FROM departments; DELETE FROM parts;
              COMMIT;",
         )?;
         self.ops.clear();
@@ -429,7 +470,13 @@ impl Store {
     /// compare two caches with each other.
     pub fn derived_dump(&self) -> Result<Vec<String>, StoreError> {
         let mut out = Vec::new();
-        for (table, key) in [("requests", "request_id"), ("op_result", "op_id")] {
+        for (table, key) in [
+            ("requests", "request_id"),
+            ("op_result", "op_id"),
+            ("comments", "op_id"),
+            ("departments", "id"),
+            ("parts", "id"),
+        ] {
             let mut stmt = self
                 .conn
                 .prepare(&format!("SELECT * FROM {table} ORDER BY {key}"))?;
@@ -499,9 +546,10 @@ fn write_request(conn: &Connection, r: &Request) -> Result<(), StoreError> {
         "INSERT OR REPLACE INTO requests (
              request_id, seq, title, description, sim_type, priority, requester, deadline,
              input_kind, input_ref, status, assignee, created_at, started_at, finished_at,
-             report_kind, report_ref, results_kind, results_ref, summary, note, deleted_at)
+             report_kind, report_ref, results_kind, results_ref, summary, note, deleted_at,
+             department, part, changed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
     )?
     .execute(params![
         r.request_id.to_string(),
@@ -526,15 +574,82 @@ fn write_request(conn: &Connection, r: &Request) -> Result<(), StoreError> {
         r.summary,
         r.note,
         r.deleted_at.map(millis),
+        r.department.map(|id| id.to_string()).unwrap_or_default(),
+        r.part.map(|id| id.to_string()).unwrap_or_default(),
+        millis(r.changed_at),
+    ])?;
+    conn.prepare_cached("DELETE FROM comments WHERE request_id = ?1")?
+        .execute(params![r.request_id.to_string()])?;
+    for comment in &r.comments {
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO comments (op_id, request_id, at_ms, by, text)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute(params![
+            comment.op_id.to_string(),
+            r.request_id.to_string(),
+            millis(comment.at_ms),
+            comment.by,
+            comment.text,
+        ])?;
+    }
+    Ok(())
+}
+
+fn write_department(conn: &Connection, d: &Department) -> Result<(), StoreError> {
+    let zones: Vec<[u16; 4]> = d.zones.iter().map(|z| [z.x, z.y, z.w, z.h]).collect();
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO departments (
+             id, seq, name, color, zones, created_at, changed_at, deleted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?
+    .execute(params![
+        d.id.to_string(),
+        d.seq,
+        d.name,
+        d.color,
+        serde_json::to_string(&zones).unwrap_or_default(),
+        millis(d.created_at),
+        millis(d.changed_at),
+        d.deleted_at.map(millis),
+    ])?;
+    Ok(())
+}
+
+fn write_part(conn: &Connection, p: &Part) -> Result<(), StoreError> {
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO parts (
+             id, seq, department, name, status, note, created_at, changed_at, deleted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?
+    .execute(params![
+        p.id.to_string(),
+        p.seq,
+        p.department.to_string(),
+        p.name,
+        p.status.as_str(),
+        p.note,
+        millis(p.created_at),
+        millis(p.changed_at),
+        p.deleted_at.map(millis),
     ])?;
     Ok(())
 }
 
 /// Replaces the derived tables with the result of a full replay.
 fn write_derived_full(conn: &Connection, state: &State) -> Result<(), StoreError> {
-    conn.execute_batch("DELETE FROM requests; DELETE FROM op_result;")?;
+    conn.execute_batch(
+        "DELETE FROM requests; DELETE FROM op_result; DELETE FROM comments;
+         DELETE FROM departments; DELETE FROM parts;",
+    )?;
     for request in state.requests.values() {
         write_request(conn, request)?;
+    }
+    for department in state.departments.values() {
+        write_department(conn, department)?;
+    }
+    for part in state.parts.values() {
+        write_part(conn, part)?;
     }
     for (op_id, outcome) in &state.outcomes {
         write_outcome(conn, op_id, outcome)?;
@@ -615,6 +730,75 @@ mod tests {
                     ops.push(op_at(c(3), t - 400, 0, n(3), id, &take_action(n(3))));
                 }
             }
+        }
+        // Departments, parts and comments, with competing changes.
+        let (dept, part) = (Uuid::new_v4(), Uuid::new_v4());
+        let zone = crate::model::Zone {
+            x: 70,
+            y: 30,
+            w: 140,
+            h: 110,
+        };
+        for (i, name) in ["Aero", "Aerodynamik", "Aero och kylning"]
+            .iter()
+            .enumerate()
+        {
+            ops.push(op_at(
+                clients[i],
+                t + 100 + (i as u64 % 2),
+                0,
+                names[i],
+                dept,
+                &NewAction::DeptSet {
+                    name: name.to_string(),
+                    color: i as u8,
+                    zones: vec![zone; i],
+                },
+            ));
+        }
+        for (i, status) in crate::model::PartStatus::ALL.into_iter().enumerate() {
+            ops.push(op_at(
+                clients[i % 4],
+                t + 200 + (i as u64 % 3),
+                0,
+                names[i % 4],
+                part,
+                &NewAction::PartSet {
+                    department: dept,
+                    name: "Bakvinge".to_string(),
+                    status,
+                    note: String::new(),
+                },
+            ));
+        }
+        ops.push(op_at(
+            clients[0],
+            t + 300,
+            0,
+            "Anna",
+            part,
+            &NewAction::PartDelete,
+        ));
+        ops.push(op_at(
+            clients[1],
+            t + 300,
+            0,
+            "Bo",
+            part,
+            &NewAction::PartDelete,
+        ));
+        let commented = ops[0].request_id;
+        for i in 0..4usize {
+            ops.push(op_at(
+                clients[i],
+                t + 400 + (i as u64 % 2),
+                0,
+                names[i],
+                commented,
+                &NewAction::Comment {
+                    text: format!("Kommentar {i}"),
+                },
+            ));
         }
         // Event for a request that is never created.
         ops.push(op_at(

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::i18n::{is_en, t};
 
-use crate::model::{OpKind, Request, Status};
+use crate::model::{Comment, Department, OpKind, Part, PartStatus, Request, Status};
 use crate::ops::{Action, Op};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +41,7 @@ impl Reject {
                 }
             }
             Reject::Deleted => {
-                t("Ärendet var borttaget", "The request had been deleted").to_string()
+                t("Det var redan borttaget", "It had already been deleted").to_string()
             }
             Reject::Invalid(msg) => format!("{}: {msg}", t("Ogiltig händelse", "Invalid event")),
         }
@@ -71,11 +71,26 @@ pub enum Outcome {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State {
     pub requests: HashMap<Uuid, Request>,
+    /// Departments and parts, deleted ones included (they have `deleted_at`).
+    pub departments: HashMap<Uuid, Department>,
+    pub parts: HashMap<Uuid, Part>,
     pub outcomes: HashMap<Uuid, Outcome>,
     waiting: HashMap<Uuid, Vec<Arc<Op>>>,
     /// True if any event requires a newer app.
     pub unsupported_seen: bool,
     next_seq: u32,
+    next_dept_seq: u32,
+    next_part_seq: u32,
+}
+
+fn deleted(by: &str, kind: OpKind) -> Outcome {
+    Outcome::Rejected {
+        reason: Reject::Deleted,
+        blocker: Some(Blocker {
+            by: by.to_string(),
+            kind,
+        }),
+    }
 }
 
 impl State {
@@ -130,6 +145,8 @@ impl State {
                         title: payload.title.clone(),
                         description: payload.description.clone(),
                         sim_type: payload.sim_type.clone(),
+                        department: payload.department,
+                        part: payload.part,
                         priority: payload.priority,
                         requester: payload.requester.clone(),
                         deadline: payload.deadline.clone(),
@@ -146,6 +163,10 @@ impl State {
                         deleted_at: None,
                         last_by: op.by.clone(),
                         last_kind: OpKind::Create,
+                        comments: Vec::new(),
+                        created_by: op.client_id,
+                        changed_at: op.hlc.wall_ms,
+                        changed_by: op.client_id,
                     };
                     self.requests.insert(op.request_id, request);
                     self.outcomes.insert(op.op_id, Outcome::Applied);
@@ -157,6 +178,10 @@ impl State {
                         }
                     }
                 }
+            }
+            Action::DeptSet(_) | Action::DeptDelete | Action::PartSet(_) | Action::PartDelete => {
+                let outcome = self.apply_board(op);
+                self.outcomes.insert(op.op_id, outcome);
             }
             _ => {
                 if self.requests.contains_key(&op.request_id) {
@@ -171,6 +196,145 @@ impl State {
             }
         }
         touched
+    }
+
+    /// Departments and parts. A "set" creates the thing or replaces its
+    /// content, so the latest one in the total order wins. A delete is final:
+    /// it also blocks a "set" for an id that has not been seen before.
+    fn apply_board(&mut self, op: &Op) -> Outcome {
+        let at = op.hlc.wall_ms;
+        let id = op.request_id;
+        match &op.action {
+            Action::DeptSet(payload) => {
+                if let Some(dept) = self.departments.get_mut(&id) {
+                    if dept.deleted_at.is_some() {
+                        return deleted(&dept.last_by, OpKind::DeptDelete);
+                    }
+                    dept.name = payload.name.clone();
+                    dept.color = payload.color;
+                    dept.zones = payload.zones.clone();
+                    dept.changed_at = at;
+                    dept.last_by = op.by.clone();
+                } else {
+                    self.next_dept_seq += 1;
+                    self.departments.insert(
+                        id,
+                        Department {
+                            id,
+                            seq: self.next_dept_seq,
+                            name: payload.name.clone(),
+                            color: payload.color,
+                            zones: payload.zones.clone(),
+                            created_at: at,
+                            changed_at: at,
+                            deleted_at: None,
+                            last_by: op.by.clone(),
+                        },
+                    );
+                }
+            }
+            Action::DeptDelete => {
+                if let Some(dept) = self.departments.get_mut(&id) {
+                    if dept.deleted_at.is_some() {
+                        return deleted(&dept.last_by, OpKind::DeptDelete);
+                    }
+                    dept.deleted_at = Some(at);
+                    dept.changed_at = at;
+                    dept.last_by = op.by.clone();
+                } else {
+                    self.next_dept_seq += 1;
+                    self.departments.insert(
+                        id,
+                        Department {
+                            id,
+                            seq: self.next_dept_seq,
+                            name: String::new(),
+                            color: 0,
+                            zones: Vec::new(),
+                            created_at: at,
+                            changed_at: at,
+                            deleted_at: Some(at),
+                            last_by: op.by.clone(),
+                        },
+                    );
+                }
+            }
+            Action::PartSet(payload) => {
+                if let Some(part) = self.parts.get_mut(&id) {
+                    if part.deleted_at.is_some() {
+                        return deleted(&part.last_by, OpKind::PartDelete);
+                    }
+                    part.department = payload.department;
+                    part.name = payload.name.clone();
+                    part.status = payload.status;
+                    part.note = payload.note.clone();
+                    part.changed_at = at;
+                    part.last_by = op.by.clone();
+                } else {
+                    self.next_part_seq += 1;
+                    self.parts.insert(
+                        id,
+                        Part {
+                            id,
+                            seq: self.next_part_seq,
+                            department: payload.department,
+                            name: payload.name.clone(),
+                            status: payload.status,
+                            note: payload.note.clone(),
+                            created_at: at,
+                            changed_at: at,
+                            deleted_at: None,
+                            last_by: op.by.clone(),
+                        },
+                    );
+                }
+            }
+            Action::PartDelete => {
+                if let Some(part) = self.parts.get_mut(&id) {
+                    if part.deleted_at.is_some() {
+                        return deleted(&part.last_by, OpKind::PartDelete);
+                    }
+                    part.deleted_at = Some(at);
+                    part.changed_at = at;
+                    part.last_by = op.by.clone();
+                } else {
+                    self.next_part_seq += 1;
+                    self.parts.insert(
+                        id,
+                        Part {
+                            id,
+                            seq: self.next_part_seq,
+                            department: Uuid::nil(),
+                            name: String::new(),
+                            status: PartStatus::NotStarted,
+                            note: String::new(),
+                            created_at: at,
+                            changed_at: at,
+                            deleted_at: Some(at),
+                            last_by: op.by.clone(),
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+        Outcome::Applied
+    }
+
+    fn preview_board(&self, op: &Op) -> Outcome {
+        let gone = match &op.action {
+            Action::DeptSet(_) | Action::DeptDelete => self
+                .departments
+                .get(&op.request_id)
+                .filter(|d| d.deleted_at.is_some())
+                .map(|d| deleted(&d.last_by, OpKind::DeptDelete)),
+            _ => self
+                .parts
+                .get(&op.request_id)
+                .filter(|p| p.deleted_at.is_some())
+                .map(|p| deleted(&p.last_by, OpKind::PartDelete)),
+        };
+        gone.unwrap_or(Outcome::Applied)
     }
 
     fn apply_to_existing(&mut self, op: &Op) {
@@ -198,6 +362,9 @@ impl State {
                 },
                 None => Outcome::Applied,
             },
+            Action::DeptSet(_) | Action::DeptDelete | Action::PartSet(_) | Action::PartDelete => {
+                self.preview_board(op)
+            }
             _ => match self.requests.get(&op.request_id) {
                 Some(existing) => transition(&mut existing.clone(), op),
                 None => Outcome::Waiting,
@@ -218,6 +385,18 @@ fn transition(request: &mut Request, op: &Op) -> Outcome {
                 kind: request.last_kind,
             }),
         };
+    }
+    if let Action::Comment { text } = &op.action {
+        // A comment never changes the status, so it does not count as the
+        // change that later events are compared with.
+        request.comments.push(Comment {
+            op_id: op.op_id,
+            at_ms: at,
+            by: op.by.clone(),
+            text: text.clone(),
+        });
+        touch(request, op);
+        return Outcome::Applied;
     }
     let kind = match &op.action {
         Action::Take { assignee } if status == Status::Queued => {
@@ -275,7 +454,17 @@ fn transition(request: &mut Request, op: &Op) -> Outcome {
     };
     request.last_by = op.by.clone();
     request.last_kind = kind;
+    touch(request, op);
     Outcome::Applied
+}
+
+/// Notes when the request last changed. An event that waited for its create
+/// can carry an earlier stamp, so the time never moves backwards.
+fn touch(request: &mut Request, op: &Op) {
+    if op.hlc.wall_ms >= request.changed_at {
+        request.changed_at = op.hlc.wall_ms;
+        request.changed_by = op.client_id;
+    }
 }
 
 pub fn sort_ops(ops: &mut [Arc<Op>]) {
@@ -725,5 +914,219 @@ mod tests {
         let state = replay(ops);
         assert_eq!(state.requests[&other].status, Status::Done);
         assert_eq!(state.requests[&other].deleted_at, Some(3));
+    }
+
+    fn dept(name: &str, zones: Vec<crate::model::Zone>) -> NewAction {
+        NewAction::DeptSet {
+            name: name.to_string(),
+            color: 1,
+            zones,
+        }
+    }
+
+    fn part(department: Uuid, name: &str, status: PartStatus) -> NewAction {
+        NewAction::PartSet {
+            department,
+            name: name.to_string(),
+            status,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn latest_set_wins_and_delete_is_final() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (dept_id, part_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let zone = crate::model::Zone {
+            x: 10,
+            y: 10,
+            w: 100,
+            h: 50,
+        };
+        let created = op_at(a, 1, 0, "Anna", dept_id, &dept("Aero", vec![]));
+        let renamed = op_at(b, 5, 0, "Bo", dept_id, &dept("Aerodynamik", vec![zone]));
+        let stale = op_at(a, 3, 0, "Anna", dept_id, &dept("Aero 2", vec![]));
+        let part_new = op_at(
+            a,
+            6,
+            0,
+            "Anna",
+            part_id,
+            &part(dept_id, "Bakvinge", PartStatus::Design),
+        );
+        let part_done = op_at(
+            b,
+            9,
+            0,
+            "Bo",
+            part_id,
+            &part(dept_id, "Bakvinge", PartStatus::Done),
+        );
+        let part_old = op_at(
+            a,
+            8,
+            0,
+            "Anna",
+            part_id,
+            &part(dept_id, "Vinge", PartStatus::Simulation),
+        );
+        let state = replay(vec![
+            part_done.clone(),
+            stale.clone(),
+            renamed.clone(),
+            part_old,
+            created,
+            part_new,
+        ]);
+        let d = &state.departments[&dept_id];
+        assert_eq!(
+            (d.name.as_str(), d.seq, d.created_at, d.changed_at),
+            ("Aerodynamik", 1, 1, 5)
+        );
+        assert_eq!(d.zones, vec![zone]);
+        assert_eq!(d.last_by, "Bo");
+        let p = &state.parts[&part_id];
+        assert_eq!((p.name.as_str(), p.status), ("Bakvinge", PartStatus::Done));
+        assert_eq!(state.outcomes[&stale.op_id], Outcome::Applied);
+
+        // Deleting is final, also for a later "set".
+        let mut ops = vec![renamed.clone(), part_done.clone()];
+        let gone = op_at(a, 10, 0, "Anna", dept_id, &NewAction::DeptDelete);
+        let back = op_at(b, 11, 0, "Bo", dept_id, &dept("Aero igen", vec![]));
+        let part_gone = op_at(a, 12, 0, "Anna", part_id, &NewAction::PartDelete);
+        let part_back = op_at(
+            b,
+            13,
+            0,
+            "Bo",
+            part_id,
+            &part(dept_id, "Vinge", PartStatus::Design),
+        );
+        ops.extend([gone, back.clone(), part_gone, part_back.clone()]);
+        let state = replay(ops);
+        assert_eq!(state.departments[&dept_id].deleted_at, Some(10));
+        assert_eq!(state.departments[&dept_id].name, "Aerodynamik");
+        assert_eq!(state.parts[&part_id].deleted_at, Some(12));
+        assert_eq!(
+            state.outcomes[&back.op_id],
+            Outcome::Rejected {
+                reason: Reject::Deleted,
+                blocker: Some(Blocker {
+                    by: "Anna".to_string(),
+                    kind: OpKind::DeptDelete
+                }),
+            }
+        );
+        assert!(matches!(
+            state.outcomes[&part_back.op_id],
+            Outcome::Rejected {
+                reason: Reject::Deleted,
+                ..
+            }
+        ));
+        assert!(matches!(state.preview(&back), Outcome::Rejected { .. }));
+
+        // A delete with an earlier stamp than the first "set" still wins.
+        let other = Uuid::new_v4();
+        let early_delete = op_at(a, 1, 0, "Anna", other, &NewAction::DeptDelete);
+        let late_set = op_at(b, 2, 0, "Bo", other, &dept("Chassi", vec![]));
+        let state = replay(vec![late_set.clone(), early_delete]);
+        assert!(state.departments[&other].deleted_at.is_some());
+        assert!(matches!(
+            state.outcomes[&late_set.op_id],
+            Outcome::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn comments_follow_the_request() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let id = Uuid::new_v4();
+        let comment = |client, t: u64, by: &str, text: &str| {
+            op_at(
+                client,
+                t,
+                0,
+                by,
+                id,
+                &NewAction::Comment {
+                    text: text.to_string(),
+                },
+            )
+        };
+        let mut create = create_action("Upright");
+        let dept_id = Uuid::new_v4();
+        if let NewAction::Create { department, .. } = &mut create {
+            *department = Some(dept_id);
+        }
+        let create = op_at(a, 10, 0, "Anna", id, &create);
+        let first = comment(b, 20, "Bo", "Vilket lastfall?");
+        let take = op_at(b, 30, 0, "Bo", id, &take_action("Bo"));
+        let second = comment(a, 40, "Anna", "Bromsning 2 g");
+        let early = comment(b, 5, "Bo", "Skickad före skapandet");
+        let state = replay(vec![
+            second.clone(),
+            take,
+            early.clone(),
+            first.clone(),
+            create,
+        ]);
+        let request = &state.requests[&id];
+        assert_eq!(request.department, Some(dept_id));
+        assert_eq!(request.created_by, a);
+        assert_eq!((request.changed_at, request.changed_by), (40, a));
+        // The status change is still what later events are compared with.
+        assert_eq!(
+            (request.last_by.as_str(), request.last_kind),
+            ("Bo", OpKind::Take)
+        );
+        let texts: Vec<&str> = request.comments.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Skickad före skapandet",
+                "Vilket lastfall?",
+                "Bromsning 2 g"
+            ]
+        );
+        for op in [&first, &second, &early] {
+            assert_eq!(state.outcomes[&op.op_id], Outcome::Applied);
+        }
+
+        // No comments on a deleted request, and none without a request.
+        let mut state = state;
+        let delete = op_at(
+            a,
+            50,
+            0,
+            "Anna",
+            id,
+            &NewAction::Delete {
+                note: String::new(),
+            },
+        );
+        state.apply(&Arc::new(delete));
+        let late = comment(b, 60, "Bo", "För sent");
+        state.apply(&Arc::new(late.clone()));
+        assert!(matches!(
+            state.outcomes[&late.op_id],
+            Outcome::Rejected {
+                reason: Reject::Deleted,
+                ..
+            }
+        ));
+        assert_eq!(state.requests[&id].comments.len(), 3);
+        let lost = op_at(
+            b,
+            70,
+            0,
+            "Bo",
+            Uuid::new_v4(),
+            &NewAction::Comment {
+                text: "Hallå?".to_string(),
+            },
+        );
+        state.apply(&Arc::new(lost.clone()));
+        assert_eq!(state.outcomes[&lost.op_id], Outcome::Waiting);
     }
 }

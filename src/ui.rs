@@ -1,7 +1,8 @@
 //! The egui user interface. Never does file I/O: all of that happens in the background
 //! thread (`sync::spawn`) and the interface only reads finished snapshots.
 
-use std::collections::VecDeque;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -12,13 +13,17 @@ use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
+mod overview;
+mod stats;
+
 use crate::blobs::{self, FileRef};
 use crate::config::{Config, Paths};
 use crate::github::{GithubRemote, RemoteState, RemoteStatus, RemoteStore};
 use crate::i18n::{self, is_en, t, Lang};
 use crate::model::{
     char_len, clean_text, is_http_url, list_order, one_line, priority_label, truncate_chars,
-    valid_deadline, LocKind, Location, Request, Status, MAX_NAME, MAX_TEXT, MAX_TITLE,
+    valid_deadline, Department, LocKind, Location, Part, Request, Status, MAX_NAME, MAX_TEXT,
+    MAX_TITLE,
 };
 use crate::ops::NewAction;
 use crate::store::SeenState;
@@ -39,6 +44,83 @@ const SIM_TYPES: [(&str, &str); 8] = [
     ("Elektromagnetisk", "Electromagnetic"),
     ("Annat", "Other"),
 ];
+
+/// The three main views of the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Queue,
+    Overview,
+    Stats,
+}
+
+/// What a finished save should do in the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// Close the open form.
+    Form,
+    /// Empty the comment field.
+    Comment,
+    Other,
+}
+
+/// The filters above the queue. They are local to this app and never synced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Filters {
+    /// `Some(None)` means requests without a department.
+    department: Option<Option<Uuid>>,
+    sim_type: Option<String>,
+    priority: Option<u8>,
+    /// Requester or assignee.
+    person: Option<String>,
+    mine: bool,
+    unread: bool,
+}
+
+impl Filters {
+    fn any(&self) -> bool {
+        *self != Filters::default()
+    }
+
+    fn matches(&self, r: &Request, me: &str, unread: &HashSet<Uuid>) -> bool {
+        let is = |name: &str| r.requester == name || r.assignee == name;
+        self.department.is_none_or(|d| r.department == d)
+            && self.sim_type.as_ref().is_none_or(|t| r.sim_type == *t)
+            && self.priority.is_none_or(|p| r.priority == p)
+            && self.person.as_ref().is_none_or(|p| is(p))
+            && (!self.mine || is(me))
+            && (!self.unread || unread.contains(&r.request_id))
+    }
+}
+
+/// A column the queue can be sorted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortCol {
+    Seq,
+    Title,
+    Department,
+    Type,
+    Priority,
+    Status,
+    Requester,
+    Assignee,
+    Deadline,
+}
+
+/// A question the user has to answer before something irreversible happens.
+struct Confirm {
+    title: String,
+    text: String,
+    button: String,
+    what: ConfirmWhat,
+}
+
+/// How many files were removed and which ones were asked for (SHA-256).
+type CleanResult = Result<(usize, Vec<String>), String>;
+
+enum ConfirmWhat {
+    Submit(Uuid, Box<NewAction>),
+    CleanFiles,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -178,6 +260,8 @@ struct NewForm {
     title: String,
     description: String,
     sim_type: String,
+    department: Option<Uuid>,
+    part: Option<Uuid>,
     priority: u8,
     requester: String,
     deadline: String,
@@ -296,6 +380,8 @@ impl Form {
                     title: f.title.trim().to_string(),
                     description: f.description.trim().to_string(),
                     sim_type: f.sim_type.trim().to_string(),
+                    department: f.department,
+                    part: f.part,
                     priority: f.priority,
                     requester: f.requester.trim().to_string(),
                     deadline: f.deadline.trim().to_string(),
@@ -357,6 +443,12 @@ enum UiAction {
     OpenNote(Uuid, NoteKind),
     OpenUrl(String),
     Download(FileRef),
+    Duplicate(Uuid),
+    SendComment(Uuid),
+    /// Opens the new request form, filled in for a department and maybe a part.
+    NewRequest(Option<Uuid>, Option<Uuid>),
+    /// Shows the request in the queue.
+    GoToRequest(Uuid),
 }
 
 /// Where the in-app update stands.
@@ -383,7 +475,18 @@ pub struct App {
     paths: Paths,
     ctx: egui::Context,
     snapshot: Arc<Snapshot>,
+    view: View,
     tab: Tab,
+    filters: Filters,
+    sort: Option<(SortCol, bool)>,
+    comment_draft: String,
+    board: overview::BoardUi,
+    confirm: Option<Confirm>,
+    pending_kind: Pending,
+    /// The request and change that was last reported as seen.
+    last_marked: Option<(Uuid, u64)>,
+    exporting: Option<Receiver<Option<Result<PathBuf, String>>>>,
+    cleaning: Option<Receiver<CleanResult>>,
     search: String,
     selected: Option<Uuid>,
     form: Option<Form>,
@@ -451,7 +554,17 @@ impl App {
             paths,
             ctx,
             snapshot,
+            view: View::Queue,
             tab: Tab::Active,
+            filters: Filters::default(),
+            sort: None,
+            comment_draft: String::new(),
+            board: overview::BoardUi::default(),
+            confirm: None,
+            pending_kind: Pending::Other,
+            last_marked: None,
+            exporting: None,
+            cleaning: None,
             search: String::new(),
             selected: None,
             form: None,
@@ -471,8 +584,10 @@ impl App {
             update_manual: false,
             downloads: Vec::new(),
         };
-        // Look for a newer version once at start-up.
-        app.check_for_update(false);
+        // Look for a newer version once at start-up (not from the tests: it uses the network).
+        if !cfg!(test) {
+            app.check_for_update(false);
+        }
         Ok(app)
     }
 
@@ -668,9 +783,11 @@ impl App {
         request_id: Option<Uuid>,
         action: NewAction,
         files: Vec<(FileSlot, PathBuf)>,
+        kind: Pending,
     ) {
         let token = self.token();
         self.pending = Some(token);
+        self.pending_kind = kind;
         self.form_error = None;
         self.handle.send(Cmd::Submit {
             token,
@@ -678,6 +795,106 @@ impl App {
             action,
             files,
         });
+    }
+
+    /// Saves several events in one go, e.g. the suggested departments.
+    fn submit_many(&mut self, items: Vec<(Uuid, NewAction)>) {
+        let token = self.token();
+        self.pending = Some(token);
+        self.pending_kind = Pending::Other;
+        self.handle.send(Cmd::SubmitMany { token, items });
+    }
+
+    /// The requests that pass the search and the filters, and the tab if one is given.
+    fn filtered<'a>(&self, snapshot: &'a Snapshot, tab: Option<Tab>) -> Vec<&'a Request> {
+        let needle = self.search.trim().to_lowercase();
+        snapshot
+            .requests
+            .iter()
+            .filter(|r| {
+                tab.is_none_or(|tab| tab.matches(r.status))
+                    && matches_search(r, &needle, snapshot)
+                    && self
+                        .filters
+                        .matches(r, &self.config.display_name, &snapshot.unread)
+            })
+            .collect()
+    }
+
+    /// Asks where to save the list as CSV and writes it in a background thread.
+    fn export_csv(&mut self) {
+        if self.exporting.is_some() {
+            return;
+        }
+        let snapshot = Arc::clone(&self.snapshot);
+        let mut rows = self.filtered(&snapshot, Some(self.tab));
+        self.sort_rows(&mut rows, &snapshot);
+        let text = crate::export::requests_csv(&rows, &snapshot.departments, &snapshot.parts);
+        let name = format!("simq-{}.csv", Local::now().format("%Y-%m-%d"));
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("simq-export".to_string())
+            .spawn(move || {
+                let dest = rfd::FileDialog::new()
+                    .set_title(t("Spara listan som CSV", "Save the list as CSV"))
+                    .set_file_name(name)
+                    .save_file();
+                let result = dest.map(|dest| {
+                    std::fs::write(&dest, text.as_bytes())
+                        .map(|()| dest)
+                        .map_err(|e| e.to_string())
+                });
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.exporting = Some(rx);
+        }
+    }
+
+    /// Removes uploaded files that only deleted requests refer to.
+    fn clean_files(&mut self) {
+        let Some(folder) = self.config.effective_folder(&self.paths) else {
+            return;
+        };
+        if self.cleaning.is_some() {
+            return;
+        }
+        let files = self.snapshot.orphan_files.clone();
+        let github = self.config.github.clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("simq-clean".to_string())
+            .spawn(move || {
+                let mut remote = github.map(|config| GithubRemote::new(&config));
+                let result = blobs::remove(
+                    &folder,
+                    remote.as_mut().map(|r| r as &mut dyn RemoteStore),
+                    &files,
+                )
+                .map(|removed| (removed, files.into_iter().map(|f| f.sha256).collect()));
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.cleaning = Some(rx);
+        }
+    }
+
+    fn sort_rows(&self, rows: &mut [&Request], snapshot: &Snapshot) {
+        match self.sort {
+            None => rows.sort_by(|a, b| list_order(a, b)),
+            Some((col, ascending)) => rows.sort_by(|a, b| {
+                let order = sort_cmp(col, a, b, snapshot).then(a.seq.cmp(&b.seq));
+                if ascending {
+                    order
+                } else {
+                    order.reverse()
+                }
+            }),
+        }
     }
 
     /// Asks where to save an uploaded file and fetches it in a background thread.
@@ -751,12 +968,19 @@ impl App {
                         continue;
                     }
                     self.pending = None;
+                    let kind = self.pending_kind;
                     match result {
-                        Ok(()) => {
-                            self.form = None;
-                            self.form_error = None;
+                        Ok(()) => match kind {
+                            Pending::Form => {
+                                self.form = None;
+                                self.form_error = None;
+                            }
+                            Pending::Comment => self.comment_draft.clear(),
+                            Pending::Other => {}
+                        },
+                        Err(text) if kind == Pending::Form && self.form.is_some() => {
+                            self.form_error = Some(text)
                         }
-                        Err(text) if self.form.is_some() => self.form_error = Some(text),
                         Err(text) => self.notices.push_back(Notice {
                             title: t("Det gick inte att spara", "Could not save").to_string(),
                             text,
@@ -792,6 +1016,59 @@ impl App {
         }
         self.snapshot = self.handle.snapshot();
         self.poll_downloads(ctx);
+
+        if let Some(rx) = &self.exporting {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.exporting = None;
+                    match result {
+                        Some(Ok(dest)) => self.notices.push_back(Notice {
+                            title: t("Listan är sparad", "The list is saved").to_string(),
+                            text: dest.display().to_string(),
+                        }),
+                        Some(Err(text)) => self.notices.push_back(Notice {
+                            title: t("Listan kunde inte sparas", "The list could not be saved")
+                                .to_string(),
+                            text,
+                        }),
+                        None => {}
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.exporting = None,
+            }
+        }
+        if let Some(rx) = &self.cleaning {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.cleaning = None;
+                    match result {
+                        Ok((removed, sha256)) => {
+                            self.handle.send(Cmd::FilesCleaned(sha256));
+                            self.notices.push_back(Notice {
+                                title: t("Filerna är rensade", "The files are cleaned up")
+                                    .to_string(),
+                                text: if is_en() {
+                                    format!("{removed} file(s) were removed.")
+                                } else {
+                                    format!("{removed} fil(er) togs bort.")
+                                },
+                            });
+                        }
+                        Err(text) => self.notices.push_back(Notice {
+                            title: t(
+                                "Filerna kunde inte rensas",
+                                "The files could not be cleaned up",
+                            )
+                            .to_string(),
+                            text,
+                        }),
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.cleaning = None,
+            }
+        }
 
         if let Some(rx) = &self.update_rx {
             match rx.try_recv() {
@@ -1102,33 +1379,35 @@ impl App {
                 ui.horizontal(|ui| {
                     theme::logo(ui, logo.as_ref(), 26.0);
                     ui.label(RichText::new("SimQ").size(20.0).strong());
-                    ui.add_space(14.0);
+                    ui.add_space(10.0);
+                    for (view, label) in [
+                        (View::Queue, t("Kö", "Queue")),
+                        (View::Overview, t("Översikt", "Overview")),
+                        (View::Stats, t("Statistik", "Statistics")),
+                    ] {
+                        ui.selectable_value(&mut self.view, view, RichText::new(label).strong());
+                    }
+                    ui.add_space(10.0);
                     if theme::add_primary(ui, can_write, t("+ Ny förfrågan", "+ New request"))
                         .on_disabled_hover_text(self.why_read_only())
                         .clicked()
                     {
-                        self.form_error = None;
-                        self.form = Some(Form::New(NewForm {
-                            title: String::new(),
-                            description: String::new(),
-                            sim_type: String::new(),
-                            priority: 2,
-                            requester: self.config.display_name.clone(),
-                            deadline: String::new(),
-                            input: LocInput::default(),
-                        }));
+                        self.open_new_form(None, None);
                     }
-                    ui.add_space(12.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text(t(
-                                "Sök titel, beställare eller typ",
-                                "Search title, requester or type",
-                            ))
-                            .desired_width(260.0),
-                    );
-                    if !self.search.is_empty() && ui.small_button(t("Rensa", "Clear")).clicked() {
-                        self.search.clear();
+                    if self.view == View::Queue {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search)
+                                .hint_text(t(
+                                    "Sök titel, beställare, typ, avdelning",
+                                    "Search title, requester, type, department",
+                                ))
+                                .desired_width(230.0),
+                        );
+                        if !self.search.is_empty() && ui.small_button(t("Rensa", "Clear")).clicked()
+                        {
+                            self.search.clear();
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(t("Inställningar", "Settings")).clicked() {
@@ -1141,14 +1420,14 @@ impl App {
                         self.update_button(ui);
                     });
                 });
+                if self.view != View::Queue {
+                    return;
+                }
                 ui.add_space(6.0);
+                let base = self.filtered(&snapshot, None);
                 ui.horizontal_wrapped(|ui| {
                     for tab in Tab::ALL {
-                        let count = snapshot
-                            .requests
-                            .iter()
-                            .filter(|r| tab.matches(r.status))
-                            .count();
+                        let count = base.iter().filter(|r| tab.matches(r.status)).count();
                         ui.selectable_value(
                             &mut self.tab,
                             tab,
@@ -1156,7 +1435,161 @@ impl App {
                         );
                     }
                 });
+                ui.add_space(2.0);
+                self.filter_ui(ui, &snapshot);
             });
+    }
+
+    /// Opens the form for a new request, optionally filled in for a department and a part.
+    fn open_new_form(&mut self, department: Option<Uuid>, part: Option<Uuid>) {
+        self.form_error = None;
+        self.form = Some(Form::New(NewForm {
+            title: String::new(),
+            description: String::new(),
+            sim_type: String::new(),
+            department,
+            part,
+            priority: 2,
+            requester: self.config.display_name.clone(),
+            deadline: String::new(),
+            input: LocInput::default(),
+        }));
+    }
+
+    /// The row of filters above the queue.
+    fn filter_ui(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let all = t("Alla", "All");
+        let mut types: Vec<&str> = snapshot
+            .requests
+            .iter()
+            .map(|r| r.sim_type.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        let mut people: Vec<&str> = snapshot
+            .requests
+            .iter()
+            .flat_map(|r| [r.requester.as_str(), r.assignee.as_str()])
+            .filter(|p| !p.trim().is_empty())
+            .collect();
+        people.sort_unstable();
+        people.dedup();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(t("Filter:", "Filter:"));
+            let department = match self.filters.department {
+                None => all.to_string(),
+                Some(None) => t("Utan avdelning", "No department").to_string(),
+                Some(Some(id)) => department_name(snapshot, Some(id)),
+            };
+            egui::ComboBox::from_id_salt("filter_department")
+                .selected_text(format!("{}: {department}", t("Avdelning", "Department")))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.filters.department, None, all);
+                    for d in &snapshot.departments {
+                        ui.selectable_value(
+                            &mut self.filters.department,
+                            Some(Some(d.id)),
+                            truncate_chars(&one_line(&d.name), 40),
+                        );
+                    }
+                    ui.selectable_value(
+                        &mut self.filters.department,
+                        Some(None),
+                        t("Utan avdelning", "No department"),
+                    );
+                });
+            egui::ComboBox::from_id_salt("filter_type")
+                .selected_text(format!(
+                    "{}: {}",
+                    t("Typ", "Type"),
+                    truncate_chars(
+                        &one_line(self.filters.sim_type.as_deref().unwrap_or(all)),
+                        30
+                    )
+                ))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.filters.sim_type, None, all);
+                    for sim_type in &types {
+                        ui.selectable_value(
+                            &mut self.filters.sim_type,
+                            Some(sim_type.to_string()),
+                            truncate_chars(&one_line(sim_type), 40),
+                        );
+                    }
+                });
+            egui::ComboBox::from_id_salt("filter_priority")
+                .selected_text(format!(
+                    "{}: {}",
+                    t("Prioritet", "Priority"),
+                    self.filters.priority.map(priority_label).unwrap_or(all)
+                ))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.filters.priority, None, all);
+                    for priority in 1..=3u8 {
+                        ui.selectable_value(
+                            &mut self.filters.priority,
+                            Some(priority),
+                            priority_label(priority),
+                        );
+                    }
+                });
+            egui::ComboBox::from_id_salt("filter_person")
+                .selected_text(format!(
+                    "{}: {}",
+                    t("Person", "Person"),
+                    truncate_chars(&one_line(self.filters.person.as_deref().unwrap_or(all)), 30)
+                ))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.filters.person, None, all);
+                    for person in &people {
+                        ui.selectable_value(
+                            &mut self.filters.person,
+                            Some(person.to_string()),
+                            truncate_chars(&one_line(person), 40),
+                        );
+                    }
+                });
+            ui.toggle_value(&mut self.filters.mine, t("Mina", "Mine"))
+                .on_hover_text(t(
+                    "Bara ärenden där du är beställare eller utförare",
+                    "Only requests where you are the requester or the assignee",
+                ));
+            let unread = snapshot.unread.len();
+            let label = if unread > 0 {
+                format!("{} {unread}", t("Nytt för dig", "New for you"))
+            } else {
+                t("Nytt för dig", "New for you").to_string()
+            };
+            ui.toggle_value(&mut self.filters.unread, label)
+                .on_hover_text(t(
+                    "Dina ärenden som någon annan har ändrat sedan du senast öppnade dem",
+                    "Your requests that someone else has changed since you last opened them",
+                ));
+            if self.filters.any()
+                && ui
+                    .small_button(t("Rensa filter", "Clear filters"))
+                    .clicked()
+            {
+                self.filters = Filters::default();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        self.exporting.is_none(),
+                        egui::Button::new(t("Exportera CSV", "Export CSV")).small(),
+                    )
+                    .on_hover_text(t(
+                        "Sparar listan som den visas nu, till exempel för Excel",
+                        "Saves the list as it is shown now, for example for Excel",
+                    ))
+                    .clicked()
+                {
+                    self.export_csv();
+                }
+            });
+        });
     }
 
     fn status_ui(&mut self, ctx: &egui::Context) {
@@ -1245,15 +1678,12 @@ impl App {
 
     fn table_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
         let snapshot = Arc::clone(&self.snapshot);
-        let needle = self.search.trim().to_lowercase();
-        let tab = self.tab;
+        let filtering = !self.search.trim().is_empty() || self.filters.any();
         let selected = self.selected;
-        let mut rows: Vec<&Request> = snapshot
-            .requests
-            .iter()
-            .filter(|r| tab.matches(r.status) && matches_search(r, &needle))
-            .collect();
-        rows.sort_by(|a, b| list_order(a, b));
+        let mut rows = self.filtered(&snapshot, Some(self.tab));
+        self.sort_rows(&mut rows, &snapshot);
+        let sort = self.sort;
+        let mut clicked_header = None;
         let today = Local::now().date_naive();
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1265,10 +1695,13 @@ impl App {
                             "Inga förfrågningar än. Klicka på \"+ Ny förfrågan\" för att lägga upp den första.",
                             "No requests yet. Click \"+ New request\" to add the first one.",
                         ));
-                    } else if needle.is_empty() {
-                        ui.weak(t("Inga ärenden under den här fliken.", "No requests under this tab."));
+                    } else if filtering {
+                        ui.weak(t(
+                            "Inga ärenden matchar sökningen och filtren.",
+                            "No requests match the search and the filters.",
+                        ));
                     } else {
-                        ui.weak(t("Inga ärenden matchar sökningen.", "No requests match the search."));
+                        ui.weak(t("Inga ärenden under den här fliken.", "No requests under this tab."));
                     }
                 });
                 return;
@@ -1276,39 +1709,60 @@ impl App {
             // A click should select the row, not select text.
             ui.style_mut().interaction.selectable_labels = false;
             let overdue_color = ui.visuals().error_fg_color;
+            let dark = ui.visuals().dark_mode;
             TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
                 .sense(egui::Sense::click())
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::initial(40.0).at_least(30.0).clip(true))
-                .column(Column::remainder().at_least(160.0).clip(true))
-                .column(Column::initial(130.0).at_least(50.0).clip(true))
+                .column(Column::remainder().at_least(150.0).clip(true))
+                .column(Column::initial(115.0).at_least(50.0).clip(true))
+                .column(Column::initial(115.0).at_least(50.0).clip(true))
                 .column(Column::initial(70.0).at_least(50.0).clip(true))
-                .column(Column::initial(110.0).at_least(70.0).clip(true))
-                .column(Column::initial(120.0).at_least(60.0).clip(true))
-                .column(Column::initial(120.0).at_least(60.0).clip(true))
+                .column(Column::initial(105.0).at_least(70.0).clip(true))
+                .column(Column::initial(105.0).at_least(60.0).clip(true))
+                .column(Column::initial(105.0).at_least(60.0).clip(true))
                 .column(Column::initial(90.0).at_least(70.0).clip(true))
-                .column(Column::initial(130.0).at_least(60.0).clip(true))
+                .column(Column::initial(120.0).at_least(60.0).clip(true))
                 .header(26.0, |mut header| {
-                    for title in [
-                        "#",
-                        t("Titel", "Title"),
-                        t("Typ", "Type"),
-                        t("Prioritet", "Priority"),
-                        "Status",
-                        t("Beställare", "Requester"),
-                        t("Utförare", "Assignee"),
-                        "Deadline",
-                        t("Rapport / resultat", "Report / results"),
+                    for (title, col) in [
+                        ("#", Some(SortCol::Seq)),
+                        (t("Titel", "Title"), Some(SortCol::Title)),
+                        (t("Avdelning", "Department"), Some(SortCol::Department)),
+                        (t("Typ", "Type"), Some(SortCol::Type)),
+                        (t("Prioritet", "Priority"), Some(SortCol::Priority)),
+                        ("Status", Some(SortCol::Status)),
+                        (t("Beställare", "Requester"), Some(SortCol::Requester)),
+                        (t("Utförare", "Assignee"), Some(SortCol::Assignee)),
+                        ("Deadline", Some(SortCol::Deadline)),
+                        (t("Rapport / resultat", "Report / results"), None),
                     ] {
                         header.col(|ui| {
-                            ui.label(
-                                RichText::new(title)
-                                    .size(12.0)
-                                    .strong()
-                                    .color(ui.visuals().weak_text_color()),
-                            );
+                            let arrow = match (sort, col) {
+                                (Some((by, ascending)), Some(col)) if by == col => {
+                                    if ascending {
+                                        " ⏶"
+                                    } else {
+                                        " ⏷"
+                                    }
+                                }
+                                _ => "",
+                            };
+                            let text = RichText::new(format!("{title}{arrow}"))
+                                .size(12.0)
+                                .strong()
+                                .color(ui.visuals().weak_text_color());
+                            let Some(col) = col else {
+                                ui.label(text);
+                                return;
+                            };
+                            let response = ui
+                                .add(egui::Label::new(text).sense(egui::Sense::click()))
+                                .on_hover_text(t("Klicka för att sortera", "Click to sort"));
+                            if response.clicked() {
+                                clicked_header = Some(col);
+                            }
                         });
                     }
                 })
@@ -1320,7 +1774,21 @@ impl App {
                             ui.weak(request.seq.to_string());
                         });
                         row.col(|ui| {
+                            if snapshot.unread.contains(&request.request_id) {
+                                theme::dot(ui, theme::ACCENT);
+                            }
                             cell(ui, &request.title);
+                            if !request.comments.is_empty() {
+                                ui.weak(format!("({})", request.comments.len())).on_hover_text(
+                                    t("Antal kommentarer", "Number of comments"),
+                                );
+                            }
+                        });
+                        row.col(|ui| {
+                            if let Some(d) = find_department(&snapshot, request.department) {
+                                theme::dot(ui, theme::dept_color(d.color, dark));
+                                cell(ui, &d.name);
+                            }
                         });
                         row.col(|ui| {
                             cell(ui, &request.sim_type);
@@ -1363,6 +1831,14 @@ impl App {
                     });
                 });
         });
+        // A click on a header sorts ascending, then descending, then back to the usual order.
+        if let Some(col) = clicked_header {
+            self.sort = match self.sort {
+                Some((by, true)) if by == col => Some((col, false)),
+                Some((by, false)) if by == col => None,
+                _ => Some((col, true)),
+            };
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1381,6 +1857,12 @@ impl App {
         let can_write = self.can_write();
         let why = self.why_read_only();
         let today = Local::now().date_naive();
+        // Opening a request counts as having seen its latest changes.
+        if snapshot.unread.contains(&id) && self.last_marked != Some((id, request.changed_at)) {
+            self.last_marked = Some((id, request.changed_at));
+            self.handle.send(Cmd::MarkSeen(id));
+        }
+        let dark = ctx.style().visuals.dark_mode;
 
         egui::SidePanel::right("detail")
             .resizable(true)
@@ -1459,6 +1941,29 @@ impl App {
                         }
 
                         theme::section(ui, t("Detaljer", "Details"));
+                        ui.horizontal_top(|ui| {
+                            theme::field_label(ui, t("Avdelning", "Department"));
+                            match find_department(&snapshot, request.department) {
+                                Some(d) => {
+                                    theme::dot(ui, theme::dept_color(d.color, dark));
+                                    ui.add(egui::Label::new(one_line(&d.name)).wrap());
+                                }
+                                None => {
+                                    ui.weak("–");
+                                }
+                            }
+                        });
+                        if let Some(part) = find_part(&snapshot, request.part) {
+                            ui.horizontal_top(|ui| {
+                                theme::field_label(ui, t("Del", "Part"));
+                                ui.add(egui::Label::new(one_line(&part.name)).wrap());
+                                theme::pill(
+                                    ui,
+                                    part.status.label(),
+                                    theme::part_status_color(part.status, dark),
+                                );
+                            });
+                        }
                         text_field(ui, t("Typ", "Type"), &request.sim_type);
                         ui.horizontal_top(|ui| {
                             theme::field_label(ui, t("Prioritet", "Priority"));
@@ -1539,10 +2044,56 @@ impl App {
                                     actions.push(UiAction::OpenNote(id, NoteKind::Cancel));
                                 }
                             }
+                            if button(ui, t("Duplicera…", "Duplicate…")) {
+                                actions.push(UiAction::Duplicate(id));
+                            }
                             if button(ui, t("Ta bort…", "Delete…")) {
                                 actions.push(UiAction::OpenNote(id, NoteKind::Delete));
                             }
                         });
+
+                        theme::section(
+                            ui,
+                            &format!(
+                                "{} ({})",
+                                t("Kommentarer", "Comments"),
+                                request.comments.len()
+                            ),
+                        );
+                        ui.add_space(2.0);
+                        for comment in &request.comments {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(one_line(&comment.by)).strong());
+                                ui.weak(format_time(comment.at_ms));
+                            });
+                            ui.add(egui::Label::new(clean_text(&comment.text)).wrap());
+                            ui.add_space(4.0);
+                        }
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.comment_draft)
+                                .hint_text(t(
+                                    "Skriv en fråga eller kommentar…",
+                                    "Write a question or a comment…",
+                                ))
+                                .char_limit(MAX_TEXT)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY),
+                        );
+                        let has_text = !self.comment_draft.trim().is_empty();
+                        if ui
+                            .add_enabled(
+                                can_write && has_text,
+                                egui::Button::new(t("Skicka kommentar", "Send comment")),
+                            )
+                            .on_disabled_hover_text(if has_text {
+                                why
+                            } else {
+                                t("Skriv något först", "Write something first")
+                            })
+                            .clicked()
+                        {
+                            actions.push(UiAction::SendComment(id));
+                        }
 
                         theme::section(ui, t("Historik", "History"));
                         ui.add_space(2.0);
@@ -1596,7 +2147,7 @@ impl App {
                 egui::ScrollArea::vertical()
                     .max_height((ctx.screen_rect().height() - 160.0).max(200.0))
                     .show(ui, |ui| match &mut form {
-                        Form::New(f) => new_form_ui(ui, f),
+                        Form::New(f) => new_form_ui(ui, f, &self.snapshot),
                         Form::Finish(f) => finish_form_ui(ui, f),
                         Form::Note(f) => note_form_ui(ui, f),
                     });
@@ -1637,7 +2188,7 @@ impl App {
 
         if send {
             let (request_id, action, files) = form.action();
-            self.submit(request_id, action, files);
+            self.submit(request_id, action, files, Pending::Form);
         }
         if close {
             self.form_error = None;
@@ -1759,6 +2310,46 @@ impl App {
                     self.handle.send(Cmd::Rebuild);
                 }
 
+                if !snapshot.orphan_files.is_empty() {
+                    ui.add_space(8.0);
+                    let size: u64 = snapshot.orphan_files.iter().map(|f| f.size).sum();
+                    ui.label(if is_en() {
+                        format!(
+                            "{} uploaded file(s) ({}) belong only to deleted requests.",
+                            snapshot.orphan_files.len(),
+                            blobs::size_label(size)
+                        )
+                    } else {
+                        format!(
+                            "{} uppladdade fil(er) ({}) hör bara till borttagna ärenden.",
+                            snapshot.orphan_files.len(),
+                            blobs::size_label(size)
+                        )
+                    });
+                    let busy = self.cleaning.is_some();
+                    if ui
+                        .add_enabled(
+                            !busy && snapshot.status == FolderStatus::Ok,
+                            egui::Button::new(t("Rensa filerna…", "Clean up the files…")),
+                        )
+                        .clicked()
+                    {
+                        self.confirm = Some(Confirm {
+                            title: t("Rensa filer", "Clean up files").to_string(),
+                            text: t(
+                                "Filerna tas bort för alla i laget och går inte att få tillbaka. Ärendena är redan borttagna.",
+                                "The files are removed for everyone on the team and cannot be brought back. The requests are already deleted.",
+                            )
+                            .to_string(),
+                            button: t("Rensa filerna", "Clean up the files").to_string(),
+                            what: ConfirmWhat::CleanFiles,
+                        });
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                }
+
                 ui.add_space(8.0);
                 egui::CollapsingHeader::new(format!(
                     "{} ({})",
@@ -1862,6 +2453,42 @@ impl App {
             });
     }
 
+    /// Asks before something that cannot be undone.
+    fn confirm_ui(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = &self.confirm else {
+            return;
+        };
+        let can_write = self.can_write();
+        let (mut yes, mut no) = (false, false);
+        egui::Window::new(one_line(&confirm.title))
+            .id(egui::Id::new("confirm_window"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.add_space(4.0);
+                ui.label(&confirm.text);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    yes = theme::add_primary(ui, can_write, &confirm.button).clicked();
+                    no = ui.button(t("Avbryt", "Cancel")).clicked();
+                });
+            });
+        if yes {
+            if let Some(confirm) = self.confirm.take() {
+                match confirm.what {
+                    ConfirmWhat::Submit(id, action) => {
+                        self.submit(Some(id), *action, Vec::new(), Pending::Other)
+                    }
+                    ConfirmWhat::CleanFiles => self.clean_files(),
+                }
+            }
+        } else if no {
+            self.confirm = None;
+        }
+    }
+
     fn notice_ui(&mut self, ctx: &egui::Context) {
         let Some(notice) = self.notices.front() else {
             return;
@@ -1890,7 +2517,60 @@ impl App {
     fn apply(&mut self, ctx: &egui::Context, actions: Vec<UiAction>) {
         for action in actions {
             match action {
-                UiAction::Select(id) => self.selected = Some(id),
+                UiAction::Select(id) => {
+                    if self.selected != Some(id) {
+                        self.comment_draft.clear();
+                    }
+                    self.selected = Some(id);
+                }
+                UiAction::GoToRequest(id) => {
+                    self.view = View::Queue;
+                    self.tab = Tab::All;
+                    self.filters = Filters::default();
+                    self.search.clear();
+                    self.comment_draft.clear();
+                    self.selected = Some(id);
+                }
+                UiAction::NewRequest(department, part) => self.open_new_form(department, part),
+                UiAction::SendComment(id) => {
+                    let text = self.comment_draft.trim().to_string();
+                    if !text.is_empty() {
+                        self.submit(
+                            Some(id),
+                            NewAction::Comment { text },
+                            Vec::new(),
+                            Pending::Comment,
+                        );
+                    }
+                }
+                UiAction::Duplicate(id) => {
+                    if let Some(request) =
+                        self.snapshot.requests.iter().find(|r| r.request_id == id)
+                    {
+                        // An uploaded file is not copied: it is chosen again if needed.
+                        let input = match &request.input {
+                            Some(l) if l.kind != LocKind::File => LocInput {
+                                kind: l.kind,
+                                value: l.value.clone(),
+                                ..LocInput::default()
+                            },
+                            _ => LocInput::default(),
+                        };
+                        self.form_error = None;
+                        self.form = Some(Form::New(NewForm {
+                            title: request.title.clone(),
+                            description: request.description.clone(),
+                            sim_type: request.sim_type.clone(),
+                            department: find_department(&self.snapshot, request.department)
+                                .map(|d| d.id),
+                            part: find_part(&self.snapshot, request.part).map(|p| p.id),
+                            priority: request.priority,
+                            requester: self.config.display_name.clone(),
+                            deadline: String::new(),
+                            input,
+                        }));
+                    }
+                }
                 UiAction::CloseDetail => self.selected = None,
                 UiAction::Take(id) => self.submit(
                     Some(id),
@@ -1898,8 +2578,11 @@ impl App {
                         assignee: self.config.display_name.clone(),
                     },
                     Vec::new(),
+                    Pending::Other,
                 ),
-                UiAction::Requeue(id) => self.submit(Some(id), NewAction::Requeue, Vec::new()),
+                UiAction::Requeue(id) => {
+                    self.submit(Some(id), NewAction::Requeue, Vec::new(), Pending::Other)
+                }
                 UiAction::Download(file) => self.start_download(file),
                 UiAction::OpenFinish(id) => {
                     if let Some(request) =
@@ -1955,10 +2638,17 @@ impl eframe::App for App {
         let mut actions = Vec::new();
         self.top_ui(ctx);
         self.status_ui(ctx);
-        self.detail_ui(ctx, &mut actions);
-        self.table_ui(ctx, &mut actions);
+        match self.view {
+            View::Queue => {
+                self.detail_ui(ctx, &mut actions);
+                self.table_ui(ctx, &mut actions);
+            }
+            View::Overview => self.overview_ui(ctx, &mut actions),
+            View::Stats => self.stats_ui(ctx),
+        }
         self.form_ui(ctx);
         self.settings_ui(ctx);
+        self.confirm_ui(ctx);
         self.notice_ui(ctx);
         self.apply(ctx, actions);
     }
@@ -2017,11 +2707,56 @@ fn find_team_key_file() -> Option<String> {
     })
 }
 
-fn matches_search(request: &Request, needle: &str) -> bool {
+fn matches_search(request: &Request, needle: &str, snapshot: &Snapshot) -> bool {
     needle.is_empty()
         || request.title.to_lowercase().contains(needle)
         || request.requester.to_lowercase().contains(needle)
+        || request.assignee.to_lowercase().contains(needle)
         || request.sim_type.to_lowercase().contains(needle)
+        || find_department(snapshot, request.department)
+            .is_some_and(|d| d.name.to_lowercase().contains(needle))
+        || find_part(snapshot, request.part).is_some_and(|p| p.name.to_lowercase().contains(needle))
+}
+
+/// The department with the given id, if it still exists.
+fn find_department(snapshot: &Snapshot, id: Option<Uuid>) -> Option<&Department> {
+    let id = id?;
+    snapshot.departments.iter().find(|d| d.id == id)
+}
+
+fn find_part(snapshot: &Snapshot, id: Option<Uuid>) -> Option<&Part> {
+    let id = id?;
+    snapshot.parts.iter().find(|p| p.id == id)
+}
+
+fn department_name(snapshot: &Snapshot, id: Option<Uuid>) -> String {
+    find_department(snapshot, id)
+        .map(|d| truncate_chars(&one_line(&d.name), 40))
+        .unwrap_or_else(|| "–".to_string())
+}
+
+fn sort_cmp(col: SortCol, a: &Request, b: &Request, snapshot: &Snapshot) -> CmpOrdering {
+    let text = |x: &str, y: &str| x.to_lowercase().cmp(&y.to_lowercase());
+    // Empty values last, whatever the direction looks like for the rest.
+    let empty_last = |x: &str, y: &str| x.is_empty().cmp(&y.is_empty()).then(text(x, y));
+    match col {
+        SortCol::Seq => a.seq.cmp(&b.seq),
+        SortCol::Title => text(&a.title, &b.title),
+        SortCol::Department => {
+            let name = |r: &Request| {
+                find_department(snapshot, r.department)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_default()
+            };
+            empty_last(&name(a), &name(b))
+        }
+        SortCol::Type => empty_last(&a.sim_type, &b.sim_type),
+        SortCol::Priority => a.priority.cmp(&b.priority),
+        SortCol::Status => (a.status as u8).cmp(&(b.status as u8)),
+        SortCol::Requester => text(&a.requester, &b.requester),
+        SortCol::Assignee => empty_last(&a.assignee, &b.assignee),
+        SortCol::Deadline => empty_last(&a.deadline, &b.deadline),
+    }
 }
 
 fn is_overdue(request: &Request, today: NaiveDate) -> bool {
@@ -2270,7 +3005,7 @@ fn loc_input_ui(ui: &mut egui::Ui, id: &str, input: &mut LocInput) {
     ui.weak(input.kind.help());
 }
 
-fn new_form_ui(ui: &mut egui::Ui, f: &mut NewForm) {
+fn new_form_ui(ui: &mut egui::Ui, f: &mut NewForm, snapshot: &Snapshot) {
     ui.label(RichText::new(t("Titel", "Title")).strong());
     ui.add(
         egui::TextEdit::singleline(&mut f.title)
@@ -2296,6 +3031,67 @@ fn new_form_ui(ui: &mut egui::Ui, f: &mut NewForm) {
             .desired_width(f32::INFINITY),
     );
     counter(ui, &f.description, MAX_TEXT);
+    ui.add_space(6.0);
+
+    ui.label(RichText::new(t("Avdelning", "Department")).strong());
+    if snapshot.departments.is_empty() {
+        ui.weak(t(
+            "Inga avdelningar än. De läggs till under Översikt.",
+            "No departments yet. They are added under Overview.",
+        ));
+    } else {
+        // A department or part that has been removed is dropped from the form.
+        if find_department(snapshot, f.department).is_none() {
+            f.department = None;
+        }
+        if find_part(snapshot, f.part).is_none_or(|p| Some(p.department) != f.department) {
+            f.part = None;
+        }
+        let none = t("Ingen", "None");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("new_department")
+                .selected_text(match f.department {
+                    Some(id) => department_name(snapshot, Some(id)),
+                    None => none.to_string(),
+                })
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut f.department, None, none);
+                    for d in &snapshot.departments {
+                        ui.selectable_value(
+                            &mut f.department,
+                            Some(d.id),
+                            truncate_chars(&one_line(&d.name), 40),
+                        );
+                    }
+                });
+            let parts: Vec<&Part> = snapshot
+                .parts
+                .iter()
+                .filter(|p| Some(p.department) == f.department)
+                .collect();
+            if !parts.is_empty() {
+                ui.add_space(10.0);
+                ui.label(RichText::new(t("Del", "Part")).strong());
+                egui::ComboBox::from_id_salt("new_part")
+                    .selected_text(match find_part(snapshot, f.part) {
+                        Some(p) => truncate_chars(&one_line(&p.name), 30),
+                        None => none.to_string(),
+                    })
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut f.part, None, none);
+                        for p in parts {
+                            ui.selectable_value(
+                                &mut f.part,
+                                Some(p.id),
+                                truncate_chars(&one_line(&p.name), 40),
+                            );
+                        }
+                    });
+            }
+        });
+    }
     ui.add_space(6.0);
 
     ui.label(RichText::new(t("Typ", "Type")).strong());
@@ -2423,4 +3219,237 @@ fn note_form_ui(ui: &mut egui::Ui, f: &mut NoteForm) {
             .desired_width(f32::INFINITY),
     );
     counter(ui, &f.note, MAX_TEXT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::PartStatus;
+    use crate::store::Store;
+    use crate::sync::Submitted;
+    use crate::testutil::{create_action, take_action, TempDir};
+
+    fn applied(result: Result<Submitted, String>) -> Uuid {
+        match result {
+            Ok(Submitted::Applied { request_id, .. }) => request_id,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    fn client(folder: &std::path::Path, id: Uuid, name: &str) -> Client {
+        Client::new(
+            Store::open_in_memory().unwrap(),
+            id,
+            name.to_string(),
+            Some(folder.to_path_buf()),
+        )
+        .unwrap()
+    }
+
+    /// One frame of the whole app, without a window.
+    fn frame(ctx: &egui::Context, app: &mut App) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut frame = eframe::Frame::_new_kittest();
+        ctx.run(input, |ctx| eframe::App::update(app, ctx, &mut frame))
+    }
+
+    /// Starts the app against a folder that another member has filled.
+    /// Returns the app, the department and the request that belongs to it.
+    fn app_with_data(shared: &TempDir, local: &TempDir, ctx: &egui::Context) -> (App, Uuid, Uuid) {
+        let me = Uuid::new_v4();
+        let mut bo = client(shared.path(), Uuid::new_v4(), "Bo");
+        let dept = applied(bo.submit(
+            None,
+            &NewAction::DeptSet {
+                name: "Aero".to_string(),
+                color: 0,
+                zones: vec![crate::model::Zone {
+                    x: 75,
+                    y: 35,
+                    w: 125,
+                    h: 115,
+                }],
+            },
+        ));
+        let part = applied(bo.submit(
+            None,
+            &NewAction::PartSet {
+                department: dept,
+                name: "Bakvinge".to_string(),
+                status: PartStatus::Simulation,
+                note: String::new(),
+            },
+        ));
+        let mut create = create_action("Downforce bakvinge");
+        if let NewAction::Create {
+            department,
+            part: for_part,
+            sim_type,
+            ..
+        } = &mut create
+        {
+            *department = Some(dept);
+            *for_part = Some(part);
+            *sim_type = "CFD".to_string();
+        }
+        let request = applied(bo.submit(None, &create));
+        applied(bo.submit(None, &create_action("Upright")));
+        applied(bo.submit(
+            Some(request),
+            &NewAction::Comment {
+                text: "Vilken hastighet?".to_string(),
+            },
+        ));
+        applied(bo.submit(Some(request), &take_action("Bo")));
+
+        let config = Config {
+            sync_folder: Some(shared.path().to_path_buf()),
+            github: None,
+            display_name: "Anna".to_string(),
+            language: Lang::Sv,
+            client_id: me,
+        };
+        let paths = Paths {
+            config_file: local.path().join("config.json"),
+            cache_file: local.path().join("cache.sqlite"),
+            mirror_root: local.path().join("mirror"),
+            legacy_config_file: None,
+        };
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(&cc, client(shared.path(), me, "Anna"), config, paths).unwrap();
+        // Wait for the background thread's first sync.
+        for _ in 0..200 {
+            frame(ctx, &mut app);
+            if app.snapshot.status == FolderStatus::Ok && app.snapshot.requests.len() == 2 {
+                return (app, dept, request);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the first sync never finished: {:?}", app.snapshot.status);
+    }
+
+    #[test]
+    fn every_view_renders_and_filters_narrow_the_queue() {
+        let (shared, local) = (TempDir::new(), TempDir::new());
+        let ctx = egui::Context::default();
+        let (mut app, dept, request) = app_with_data(&shared, &local, &ctx);
+        let snapshot = Arc::clone(&app.snapshot);
+        assert_eq!(snapshot.departments.len(), 1);
+        assert_eq!(snapshot.parts.len(), 1);
+
+        // The queue with a request open, its comments and the new request form.
+        app.apply(&ctx, vec![UiAction::Select(request)]);
+        frame(&ctx, &mut app);
+        app.apply(&ctx, vec![UiAction::NewRequest(Some(dept), None)]);
+        frame(&ctx, &mut app);
+        assert!(matches!(&app.form, Some(Form::New(f)) if f.department == Some(dept)));
+        app.form = None;
+        app.apply(&ctx, vec![UiAction::Duplicate(request)]);
+        frame(&ctx, &mut app);
+        match &app.form {
+            Some(Form::New(f)) => {
+                assert_eq!(f.title, "Downforce bakvinge");
+                assert_eq!((f.department, f.requester.as_str()), (Some(dept), "Anna"));
+                assert!(f.part.is_some());
+            }
+            _ => panic!("the duplicate should open the new request form"),
+        }
+        app.form = None;
+
+        // Filters, search and sorting.
+        assert_eq!(app.filtered(&snapshot, None).len(), 2);
+        app.filters.department = Some(Some(dept));
+        assert_eq!(app.filtered(&snapshot, None).len(), 1);
+        assert_eq!(app.filtered(&snapshot, Some(Tab::Queued)).len(), 0);
+        app.filters.department = Some(None);
+        assert_eq!(app.filtered(&snapshot, None)[0].title, "Upright");
+        app.filters = Filters {
+            sim_type: Some("CFD".to_string()),
+            person: Some("Bo".to_string()),
+            priority: Some(2),
+            ..Filters::default()
+        };
+        assert_eq!(app.filtered(&snapshot, None).len(), 1);
+        app.filters = Filters {
+            mine: true,
+            ..Filters::default()
+        };
+        // Both requests name Anna as the requester.
+        assert_eq!(app.filtered(&snapshot, None).len(), 2);
+        app.config.display_name = "Cia".to_string();
+        assert!(app.filtered(&snapshot, None).is_empty());
+        app.config.display_name = "Anna".to_string();
+        app.filters = Filters::default();
+        app.search = "aero".to_string();
+        assert_eq!(
+            app.filtered(&snapshot, None).len(),
+            1,
+            "search finds the department"
+        );
+        app.search = "bakvinge".to_string();
+        assert_eq!(app.filtered(&snapshot, None).len(), 1);
+        app.search.clear();
+        frame(&ctx, &mut app);
+
+        let mut rows = app.filtered(&snapshot, None);
+        app.sort = Some((SortCol::Department, true));
+        app.sort_rows(&mut rows, &snapshot);
+        assert_eq!(
+            rows[0].title, "Downforce bakvinge",
+            "no department sorts last"
+        );
+        app.sort = Some((SortCol::Title, false));
+        app.sort_rows(&mut rows, &snapshot);
+        assert_eq!(rows[0].title, "Upright");
+        app.sort = None;
+
+        // The other views.
+        for view in [View::Overview, View::Stats, View::Queue] {
+            app.view = view;
+            frame(&ctx, &mut app);
+            frame(&ctx, &mut app);
+        }
+        // From the overview a request can be shown in the queue.
+        app.view = View::Overview;
+        app.filters.mine = true;
+        app.apply(&ctx, vec![UiAction::GoToRequest(request)]);
+        assert_eq!((app.view, app.selected), (View::Queue, Some(request)));
+        assert!(!app.filters.any());
+        app.settings_open = true;
+        app.settings_tab = SettingsTab::Diagnostics;
+        frame(&ctx, &mut app);
+    }
+
+    #[test]
+    fn a_comment_is_saved_and_the_field_is_emptied() {
+        let (shared, local) = (TempDir::new(), TempDir::new());
+        let ctx = egui::Context::default();
+        let (mut app, _, request) = app_with_data(&shared, &local, &ctx);
+        app.apply(&ctx, vec![UiAction::Select(request)]);
+        app.comment_draft = "  60 km/h  ".to_string();
+        app.apply(&ctx, vec![UiAction::SendComment(request)]);
+        for _ in 0..200 {
+            frame(&ctx, &mut app);
+            if app.pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.comment_draft.is_empty());
+        let snapshot = app.handle.snapshot();
+        let saved = snapshot
+            .requests
+            .iter()
+            .find(|r| r.request_id == request)
+            .unwrap();
+        assert_eq!(saved.comments.len(), 2);
+        assert_eq!(saved.comments[1].text, "60 km/h");
+        assert_eq!(saved.comments[1].by, "Anna");
+    }
 }

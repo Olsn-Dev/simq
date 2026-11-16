@@ -4,7 +4,7 @@
 //! is free of threads so that it can be tested. `spawn` starts the background thread
 //! that owns the client, so that the user interface never does file I/O.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,9 @@ use crate::config::{self, Config, Paths};
 use crate::github::{self, GithubConfig, GithubRemote, RemoteStatus, Transport};
 use crate::hlc::Clock;
 use crate::i18n::{self, is_en, t, Lang};
-use crate::model::{one_line, truncate_chars, LocKind, Location, Request, MAX_NAME};
+use crate::model::{
+    one_line, truncate_chars, Department, LocKind, Location, Part, Request, MAX_NAME,
+};
 use crate::ops::{self, FolderError, NewAction, Op, ReadError};
 use crate::replay::{Outcome, State};
 use crate::store::{Seen, SeenState, Store, StoreError};
@@ -28,6 +30,20 @@ pub const MAX_ATTEMPTS: u32 = 20;
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(15);
 const FOCUS_SYNC_MIN_GAP: Duration = Duration::from_secs(3);
 const META_FOLDER: &str = "folder";
+const META_SEEN: &str = "seen";
+
+/// Which changes to the user's own requests they have already looked at.
+/// Kept on this computer only.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SeenMarks {
+    /// Changes older than this count as seen (set the first time the app runs).
+    baseline: u64,
+    /// Request id to the `changed_at` the user last saw.
+    seen: HashMap<Uuid, u64>,
+    /// Uploaded files this app has already cleaned away (SHA-256).
+    #[serde(default)]
+    cleaned: HashSet<String>,
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -112,6 +128,14 @@ pub struct DeletedRequest {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub requests: Vec<Request>,
+    /// Departments and their parts, deleted ones left out.
+    pub departments: Vec<Department>,
+    pub parts: Vec<Part>,
+    /// The user's own requests that someone else has changed since the user
+    /// last opened them.
+    pub unread: HashSet<Uuid>,
+    /// Uploaded files that only deleted requests refer to.
+    pub orphan_files: Vec<blobs::FileRef>,
     /// Requests that have been deleted (shown under diagnostics only).
     pub deleted: Vec<DeletedRequest>,
     pub history: HashMap<Uuid, Vec<HistoryEntry>>,
@@ -138,6 +162,7 @@ pub struct Client {
     last_sync_ms: Option<u64>,
     ignored: Vec<String>,
     remote: Option<RemoteStatus>,
+    marks: SeenMarks,
 }
 
 impl Client {
@@ -152,6 +177,23 @@ impl Client {
         }
         let mut clock = Clock::new();
         let now = now_ms();
+        let marks = match store
+            .meta_get(META_SEEN)?
+            .and_then(|text| serde_json::from_str::<SeenMarks>(&text).ok())
+        {
+            Some(marks) => marks,
+            None => {
+                let marks = SeenMarks {
+                    baseline: now,
+                    ..SeenMarks::default()
+                };
+                store.meta_set(
+                    META_SEEN,
+                    &serde_json::to_string(&marks).unwrap_or_default(),
+                )?;
+                marks
+            }
+        };
         for op in store.ops() {
             clock.observe(op.hlc, now);
         }
@@ -170,7 +212,52 @@ impl Client {
             last_sync_ms: None,
             ignored: Vec::new(),
             remote: None,
+            marks,
         })
+    }
+
+    /// True if the request is the user's own (created on this app or assigned
+    /// to the user) and someone else has changed it since the user last looked.
+    fn is_unread(&self, request: &Request) -> bool {
+        let mine = request.created_by == self.client_id
+            || (!request.assignee.trim().is_empty() && request.assignee == self.display_name);
+        mine && request.deleted_at.is_none()
+            && request.changed_by != self.client_id
+            && request.changed_at
+                > self
+                    .marks
+                    .seen
+                    .get(&request.request_id)
+                    .copied()
+                    .unwrap_or(self.marks.baseline)
+    }
+
+    /// Notes that these uploaded files have been cleaned away, so that they
+    /// are not offered for cleaning again.
+    pub fn files_cleaned(&mut self, sha256: Vec<String>) -> Result<(), StoreError> {
+        self.marks.cleaned.extend(sha256);
+        self.store.meta_set(
+            META_SEEN,
+            &serde_json::to_string(&self.marks).unwrap_or_default(),
+        )
+    }
+
+    /// Notes that the user has looked at the request as it is now.
+    pub fn mark_seen(&mut self, request_id: Uuid) -> Result<(), StoreError> {
+        let Some(request) = self.store.state().requests.get(&request_id) else {
+            return Ok(());
+        };
+        if !self.is_unread(request) {
+            return Ok(());
+        }
+        self.marks.seen.insert(request_id, request.changed_at);
+        // Forget marks for requests that no longer exist.
+        let requests = &self.store.state().requests;
+        self.marks.seen.retain(|id, _| requests.contains_key(id));
+        self.store.meta_set(
+            META_SEEN,
+            &serde_json::to_string(&self.marks).unwrap_or_default(),
+        )
     }
 
     pub fn client_id(&self) -> Uuid {
@@ -551,12 +638,45 @@ impl Client {
             .collect();
         deleted.sort_by_key(|d| d.at_ms);
 
+        let mut departments: Vec<Department> = state
+            .departments
+            .values()
+            .filter(|d| d.deleted_at.is_none())
+            .cloned()
+            .collect();
+        departments.sort_by_key(|d| d.seq);
+        let mut parts: Vec<Part> = state
+            .parts
+            .values()
+            .filter(|p| {
+                p.deleted_at.is_none()
+                    && state
+                        .departments
+                        .get(&p.department)
+                        .is_some_and(|d| d.deleted_at.is_none())
+            })
+            .cloned()
+            .collect();
+        parts.sort_by_key(|p| p.seq);
+        let unread: HashSet<Uuid> = requests
+            .iter()
+            .filter(|r| self.is_unread(r))
+            .map(|r| r.request_id)
+            .collect();
+        let mut orphan_files = orphan_files(state);
+        orphan_files.retain(|f| !self.marks.cleaned.contains(&f.sha256));
+
         let mut history: HashMap<Uuid, Vec<HistoryEntry>> = HashMap::new();
         let mut rejected_ops = Vec::new();
         for op in self.store.ops() {
-            let what = match op.op_kind() {
-                Some(kind) => kind.label().to_string(),
-                None => format!(
+            let what = match (&op.action, op.op_kind()) {
+                (ops::Action::PartSet(p), _) => format!(
+                    "{}: {}",
+                    truncate_chars(&one_line(&p.name), 60),
+                    p.status.label()
+                ),
+                (_, Some(kind)) => kind.label().to_string(),
+                (_, None) => format!(
                     "{} ({})",
                     t("Okänd händelse", "Unknown event"),
                     truncate_chars(&one_line(&op.kind), 30)
@@ -622,6 +742,10 @@ impl Client {
 
         Snapshot {
             requests,
+            departments,
+            parts,
+            unread,
+            orphan_files,
             deleted,
             history,
             status: self.status.clone(),
@@ -636,6 +760,35 @@ impl Client {
             remote: self.remote.clone(),
         }
     }
+}
+
+/// Uploaded files that deleted requests refer to and no other request does.
+fn orphan_files(state: &State) -> Vec<blobs::FileRef> {
+    let files = |r: &Request| {
+        [&r.input, &r.report, &r.results]
+            .into_iter()
+            .flatten()
+            .filter(|l| l.kind == LocKind::File)
+            .filter_map(|l| blobs::FileRef::parse(&l.value))
+            .collect::<Vec<_>>()
+    };
+    let live: HashSet<String> = state
+        .requests
+        .values()
+        .filter(|r| r.deleted_at.is_none())
+        .flat_map(files)
+        .map(|f| f.sha256)
+        .collect();
+    let mut seen = HashSet::new();
+    let mut orphans: Vec<blobs::FileRef> = state
+        .requests
+        .values()
+        .filter(|r| r.deleted_at.is_some())
+        .flat_map(files)
+        .filter(|f| !live.contains(&f.sha256) && seen.insert(f.sha256.clone()))
+        .collect();
+    orphans.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    orphans
 }
 
 /// A cache belongs to one particular folder. If another folder is chosen the cache is emptied.
@@ -664,6 +817,16 @@ pub enum Cmd {
         /// Files on this computer to upload and attach to the action.
         files: Vec<(FileSlot, PathBuf)>,
     },
+    /// Several events in one go, each with the id of what it applies to.
+    /// Stops at the first one that cannot be saved.
+    SubmitMany {
+        token: u64,
+        items: Vec<(Uuid, NewAction)>,
+    },
+    /// The user has opened the request and seen its latest changes.
+    MarkSeen(Uuid),
+    /// Uploaded files with these SHA-256 have been cleaned away.
+    FilesCleaned(Vec<String>),
     Configure {
         token: u64,
         display_name: String,
@@ -825,6 +988,27 @@ impl Worker {
                         Err(e) => Err(e),
                     };
                     self.emit(Event::SubmitDone { token, result });
+                }
+                Ok(Cmd::SubmitMany { token, items }) => {
+                    let mut result = Ok(());
+                    for (id, action) in items {
+                        match self.client.submit(Some(id), &action) {
+                            Ok(Submitted::Applied { .. }) => {}
+                            Ok(Submitted::Rejected(notice)) => self.emit(Event::Notice(notice)),
+                            Err(e) => {
+                                result = Err(e);
+                                break;
+                            }
+                        }
+                    }
+                    self.wake_transport();
+                    self.emit(Event::SubmitDone { token, result });
+                }
+                Ok(Cmd::MarkSeen(request_id)) => {
+                    let _ = self.client.mark_seen(request_id);
+                }
+                Ok(Cmd::FilesCleaned(sha256)) => {
+                    let _ = self.client.files_cleaned(sha256);
                 }
                 Ok(Cmd::Configure {
                     token,
@@ -1598,5 +1782,162 @@ mod tests {
         // The cache keeps the deletion across a rebuild.
         a.rebuild().unwrap();
         assert_eq!(a.snapshot().requests.len(), 1);
+    }
+
+    #[test]
+    fn own_requests_changed_by_others_are_marked_until_opened() {
+        let shared = TempDir::new();
+        let mut a = client(shared.path(), "Anna");
+        let mut b = client(shared.path(), "Bo");
+        // The clock has moved on since the app was started.
+        std::thread::sleep(Duration::from_millis(5));
+        let id = applied(a.submit(None, &create_action("Upright")));
+        assert!(a.snapshot().unread.is_empty(), "own changes are never new");
+
+        b.sync();
+        std::thread::sleep(Duration::from_millis(5));
+        applied(b.submit(Some(id), &take_action("Bo")));
+        assert!(b.snapshot().unread.is_empty());
+        a.sync();
+        assert!(a.snapshot().unread.contains(&id));
+
+        a.mark_seen(id).unwrap();
+        assert!(a.snapshot().unread.is_empty());
+
+        // A comment from someone else marks it again, for the requester and
+        // for the one who took it when the requester answers.
+        std::thread::sleep(Duration::from_millis(5));
+        let comment = |text: &str| NewAction::Comment {
+            text: text.to_string(),
+        };
+        applied(b.submit(Some(id), &comment("Vilket lastfall?")));
+        a.sync();
+        assert!(a.snapshot().unread.contains(&id));
+        a.mark_seen(id).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        applied(a.submit(Some(id), &comment("Bromsning 2 g")));
+        assert!(a.snapshot().unread.is_empty());
+        b.sync();
+        assert!(b.snapshot().unread.contains(&id));
+        let snapshot = b.snapshot();
+        let request = &snapshot.requests[0];
+        assert_eq!(request.comments.len(), 2);
+        assert_eq!(request.comments[1].by, "Anna");
+
+        // A third person, who neither asked for it nor took it, gets no mark.
+        let mut c = client(shared.path(), "Cia");
+        c.sync();
+        assert!(c.snapshot().unread.is_empty());
+    }
+
+    #[test]
+    fn departments_and_parts_are_shared() {
+        let shared = TempDir::new();
+        let mut a = client(shared.path(), "Anna");
+        let mut b = client(shared.path(), "Bo");
+        let zone = crate::model::Zone {
+            x: 75,
+            y: 35,
+            w: 125,
+            h: 115,
+        };
+        let dept = applied(a.submit(
+            None,
+            &NewAction::DeptSet {
+                name: "Aero".to_string(),
+                color: 0,
+                zones: vec![zone],
+            },
+        ));
+        let part_set = |status| NewAction::PartSet {
+            department: dept,
+            name: "Bakvinge".to_string(),
+            status,
+            note: String::new(),
+        };
+        let part = applied(a.submit(None, &part_set(crate::model::PartStatus::Design)));
+        b.sync();
+        let snapshot = b.snapshot();
+        assert_eq!(snapshot.departments.len(), 1);
+        assert_eq!(snapshot.departments[0].zones, vec![zone]);
+        assert_eq!(snapshot.parts.len(), 1);
+
+        std::thread::sleep(Duration::from_millis(5));
+        applied(b.submit(Some(part), &part_set(crate::model::PartStatus::Done)));
+        a.sync();
+        let snapshot = a.snapshot();
+        assert_eq!(snapshot.parts[0].status, crate::model::PartStatus::Done);
+        assert_eq!(snapshot.parts[0].last_by, "Bo");
+        assert_eq!(
+            snapshot.history[&part].last().unwrap().what,
+            "Bakvinge: Klar"
+        );
+
+        // Deleting the department hides its parts, and nothing more can be saved on it.
+        std::thread::sleep(Duration::from_millis(5));
+        applied(a.submit(Some(dept), &NewAction::DeptDelete));
+        b.sync();
+        let snapshot = b.snapshot();
+        assert!(snapshot.departments.is_empty());
+        assert!(snapshot.parts.is_empty());
+        let late = b.submit(
+            Some(dept),
+            &NewAction::DeptSet {
+                name: "Aero 2".to_string(),
+                color: 1,
+                zones: Vec::new(),
+            },
+        );
+        match late {
+            Ok(Submitted::Rejected(notice)) => {
+                assert!(
+                    notice.text.contains("Anna tog bort avdelningen"),
+                    "{}",
+                    notice.text
+                )
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            fs::read_dir(shared.path().join(OPS_DIR)).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn files_of_deleted_requests_are_offered_for_cleaning() {
+        let shared = TempDir::new();
+        let mut a = client(shared.path(), "Anna");
+        let file = |sha: &str| {
+            Some(Location {
+                kind: LocKind::File,
+                value: format!("sha256:{}:10:del.step", sha.repeat(32)),
+            })
+        };
+        let create = |location: Option<Location>| {
+            let mut action = create_action("Upright");
+            if let NewAction::Create { input, .. } = &mut action {
+                *input = location;
+            }
+            action
+        };
+        let kept = applied(a.submit(None, &create(file("ab"))));
+        let gone = applied(a.submit(None, &create(file("cd"))));
+        let shared_file = applied(a.submit(None, &create(file("ab"))));
+        assert!(a.snapshot().orphan_files.is_empty());
+
+        let delete = NewAction::Delete {
+            note: String::new(),
+        };
+        applied(a.submit(Some(gone), &delete));
+        applied(a.submit(Some(shared_file), &delete));
+        // "ab" is still used by a request that is left, "cd" is not.
+        let orphans = a.snapshot().orphan_files;
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].sha256, "cd".repeat(32));
+
+        a.files_cleaned(vec![orphans[0].sha256.clone()]).unwrap();
+        assert!(a.snapshot().orphan_files.is_empty());
+        assert_eq!(a.snapshot().requests[0].request_id, kept);
     }
 }

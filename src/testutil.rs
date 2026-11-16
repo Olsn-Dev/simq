@@ -64,6 +64,8 @@ pub fn create_action(title: &str) -> NewAction {
         title: title.to_string(),
         description: "Beskrivning med å, ä och ö".to_string(),
         sim_type: "FEA".to_string(),
+        department: None,
+        part: None,
         priority: 2,
         requester: "Anna".to_string(),
         deadline: "2026-12-01".to_string(),

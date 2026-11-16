@@ -291,6 +291,37 @@ pub fn fetch(
     }
 }
 
+/// Removes uploaded files that no request uses any more, from the local
+/// store and from the remote store. Returns how many were removed.
+pub fn remove(
+    folder: &Path,
+    mut remote: Option<&mut dyn RemoteStore>,
+    files: &[FileRef],
+) -> Result<usize, String> {
+    let mut removed = 0;
+    for file in files {
+        if !valid_sha256(&file.sha256) {
+            continue;
+        }
+        let mut found = false;
+        let local = local_path(folder, &file.sha256);
+        if local.is_file() {
+            fs::remove_file(&local).map_err(|e| {
+                format!(
+                    "{}: {e}",
+                    t("Kunde inte ta bort filen", "Could not remove the file")
+                )
+            })?;
+            found = true;
+        }
+        if let Some(remote) = remote.as_deref_mut() {
+            found |= remote.delete_file(&file.sha256).map_err(|e| e.text())?;
+        }
+        removed += usize::from(found);
+    }
+    Ok(removed)
+}
+
 /// SHA-256 and size of a file on disk.
 pub fn sha256_of(path: &Path) -> std::io::Result<(String, u64)> {
     copy_hashing(fs::File::open(path)?, std::io::sink(), u64::MAX, None)
@@ -388,6 +419,19 @@ mod tests {
         assert_eq!(fs::read(&dest).unwrap(), b"abc");
         assert_eq!(progress.load(Ordering::Relaxed), 3);
 
+        // Removing takes the local copy away; a second time there is nothing to remove.
+        let other = user.path().join("gammal.step");
+        fs::write(&other, b"gammal").unwrap();
+        let old = import(folder.path(), &other).unwrap();
+        assert_eq!(local_files(folder.path()).len(), 2);
+        assert_eq!(
+            remove(folder.path(), None, std::slice::from_ref(&old)),
+            Ok(1)
+        );
+        assert_eq!(remove(folder.path(), None, &[old]), Ok(0));
+        assert_eq!(local_files(folder.path()).len(), 1);
+        assert!(local_path(folder.path(), ABC).is_file());
+
         // A file that is not here cannot be fetched without a remote store.
         let missing = FileRef {
             sha256: "0".repeat(64),
@@ -407,7 +451,7 @@ mod tests {
         };
         assert!(fetch(folder.path(), None, &tampered, &other, &progress).is_err());
         assert!(!other.exists());
-        assert_eq!(fs::read_dir(user.path()).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(user.path()).unwrap().count(), 3);
     }
 
     #[test]

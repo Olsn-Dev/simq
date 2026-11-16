@@ -8,10 +8,12 @@
 //! - `store`  – local SQLite cache
 //! - `sync`   – folder reading, submitting own events and the background thread
 //! - `config` – local configuration and identity
+//! - `export` – CSV export and statistics
 //! - `ui`     – the egui user interface
 
 pub mod blobs;
 pub mod config;
+pub mod export;
 pub mod github;
 pub mod hlc;
 pub mod i18n;

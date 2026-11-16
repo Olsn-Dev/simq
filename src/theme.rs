@@ -7,7 +7,7 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontId, Margin, Response, RichText, Stroke, TextStyle,
 };
 
-use crate::model::Status;
+use crate::model::{PartStatus, Status};
 
 /// The accent colour, also used in the app icon.
 pub const ACCENT: Color32 = Color32::from_rgb(47, 108, 235);
@@ -220,4 +220,118 @@ pub fn field_label(ui: &mut egui::Ui, label: &str) {
         FontId::proportional(13.0),
         ui.visuals().weak_text_color(),
     );
+}
+
+/// The colours a department can have: (dark mode, light mode).
+const DEPT_COLORS: [(Color32, Color32); 10] = [
+    (
+        Color32::from_rgb(110, 168, 255),
+        Color32::from_rgb(30, 100, 210),
+    ),
+    (
+        Color32::from_rgb(255, 160, 96),
+        Color32::from_rgb(200, 96, 20),
+    ),
+    (
+        Color32::from_rgb(120, 210, 140),
+        Color32::from_rgb(24, 130, 60),
+    ),
+    (
+        Color32::from_rgb(232, 130, 200),
+        Color32::from_rgb(176, 50, 140),
+    ),
+    (
+        Color32::from_rgb(190, 150, 255),
+        Color32::from_rgb(110, 70, 200),
+    ),
+    (
+        Color32::from_rgb(240, 205, 90),
+        Color32::from_rgb(150, 115, 0),
+    ),
+    (
+        Color32::from_rgb(90, 210, 215),
+        Color32::from_rgb(0, 130, 140),
+    ),
+    (
+        Color32::from_rgb(255, 125, 125),
+        Color32::from_rgb(195, 45, 45),
+    ),
+    (
+        Color32::from_rgb(170, 200, 110),
+        Color32::from_rgb(95, 125, 20),
+    ),
+    (
+        Color32::from_rgb(170, 178, 195),
+        Color32::from_rgb(95, 105, 125),
+    ),
+];
+
+pub fn dept_color(index: u8, dark: bool) -> Color32 {
+    let (in_dark, in_light) = DEPT_COLORS[usize::from(index) % DEPT_COLORS.len()];
+    if dark {
+        in_dark
+    } else {
+        in_light
+    }
+}
+
+pub fn part_status_color(status: PartStatus, dark: bool) -> Color32 {
+    match status {
+        PartStatus::NotStarted => status_color(Status::Cancelled, dark),
+        PartStatus::Design => status_color(Status::Queued, dark),
+        PartStatus::Simulation => dept_color(4, dark),
+        PartStatus::Manufacturing => status_color(Status::Running, dark),
+        PartStatus::Done => status_color(Status::Done, dark),
+    }
+}
+
+/// Colour for how far something has come: grey when there is nothing to
+/// measure, then from red over amber to green.
+pub fn progress_color(progress: Option<f32>, dark: bool) -> Color32 {
+    let Some(p) = progress else {
+        return status_color(Status::Cancelled, dark);
+    };
+    let (low, mid, high) = (
+        status_color(Status::Failed, dark),
+        status_color(Status::Running, dark),
+        status_color(Status::Done, dark),
+    );
+    let mix = |a: Color32, b: Color32, t: f32| {
+        let ch = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+        Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
+    };
+    let p = p.clamp(0.0, 1.0);
+    if p < 0.5 {
+        mix(low, mid, p * 2.0)
+    } else {
+        mix(mid, high, (p - 0.5) * 2.0)
+    }
+}
+
+/// A thin progress bar. `progress` is 0.0 to 1.0, or `None` for "nothing to measure".
+pub fn progress_bar(ui: &mut egui::Ui, progress: Option<f32>, width: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 6.0), egui::Sense::hover());
+    let radius = CornerRadius::same(3);
+    ui.painter()
+        .rect_filled(rect, radius, ui.visuals().widgets.inactive.bg_fill);
+    if let Some(p) = progress {
+        let mut filled = rect;
+        filled.set_width(rect.width() * p.clamp(0.0, 1.0));
+        if filled.width() >= 1.0 {
+            ui.painter().rect_filled(
+                filled,
+                radius,
+                progress_color(progress, ui.visuals().dark_mode),
+            );
+        }
+    }
+    response
+}
+
+/// "60 %" or "–".
+pub fn percent_label(progress: Option<f32>) -> String {
+    match progress {
+        Some(p) => format!("{} %", (p * 100.0).round() as u32),
+        None => "–".to_string(),
+    }
 }

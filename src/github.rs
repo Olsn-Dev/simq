@@ -149,6 +149,8 @@ pub trait RemoteStore: Send {
         dest: &Path,
         progress: &AtomicU64,
     ) -> Result<(), RemoteError>;
+    /// Removes a user file. True if there was one to remove.
+    fn delete_file(&mut self, sha256: &str) -> Result<bool, RemoteError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +524,29 @@ impl RemoteStore for GithubRemote {
             progress.store(total, Ordering::Relaxed);
         }
         file.sync_all().map_err(save)
+    }
+
+    fn delete_file(&mut self, sha256: &str) -> Result<bool, RemoteError> {
+        if !blobs::valid_sha256(sha256) {
+            return Err(RemoteError::Other(
+                t("ogiltig sökväg", "invalid path").to_string(),
+            ));
+        }
+        let Some(release) = self.file_release(&file_bucket(sha256), false)? else {
+            return Ok(false);
+        };
+        let Some(asset) = self.find_asset(release.id, sha256)? else {
+            return Ok(false);
+        };
+        let url = format!(
+            "{}/repos/{}/releases/assets/{}",
+            self.base, self.repo, asset.id
+        );
+        match self.request("DELETE", &url).call() {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(404, _)) => Ok(false),
+            Err(e) => Err(classify(e)),
+        }
     }
 
     fn list(&mut self, etag: Option<&str>) -> Result<Listing, RemoteError> {
@@ -1056,6 +1081,11 @@ mod tests {
             std::fs::write(dest, &bytes).map_err(|e| RemoteError::Other(e.to_string()))?;
             progress.store(bytes.len() as u64, Ordering::Relaxed);
             Ok(())
+        }
+
+        fn delete_file(&mut self, sha256: &str) -> Result<bool, RemoteError> {
+            self.offline()?;
+            Ok(self.repo().blobs.remove(sha256).is_some())
         }
     }
 
@@ -1847,6 +1877,22 @@ mod tests {
         // Uploading again does nothing.
         assert_eq!(remote.upload_file(&sha256, &source), Ok(()));
         assert_eq!(server.lock().unwrap().assets.len(), 1);
+
+        // Removing a file takes it away once; a second time there is nothing left.
+        {
+            let other = tmp.path().join("annan.step");
+            std::fs::write(&other, b"tas bort").unwrap();
+            let (other_sha, _) = blobs::sha256_of(&other).unwrap();
+            assert_eq!(remote.delete_file(&other_sha), Ok(false));
+            assert_eq!(remote.upload_file(&other_sha, &other), Ok(()));
+            assert_eq!(server.lock().unwrap().assets.len(), 2);
+            assert_eq!(remote.delete_file(&other_sha), Ok(true));
+            assert_eq!(remote.delete_file(&other_sha), Ok(false));
+            assert!(remote.delete_file("../../etc/passwd").is_err());
+            let server = server.lock().unwrap();
+            assert_eq!(server.assets.len(), 1);
+            assert_eq!(server.assets[0].2, sha256);
+        }
 
         assert_eq!(
             remote.download_file(&sha256, size, &dest, &progress),

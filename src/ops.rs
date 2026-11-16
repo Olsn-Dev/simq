@@ -15,17 +15,21 @@ use uuid::Uuid;
 use crate::hlc::Hlc;
 use crate::i18n::{is_en, t};
 use crate::model::{
-    char_len, parse_location, truncate_chars, valid_deadline, LocKind, Location, OpKind, MAX_NAME,
-    MAX_TEXT, MAX_TITLE,
+    char_len, parse_location, truncate_chars, valid_deadline, LocKind, Location, OpKind,
+    PartStatus, Zone, COLOR_COUNT, MAX_DEPT_NAME, MAX_NAME, MAX_PART_NAME, MAX_TEXT, MAX_TITLE,
+    MAX_ZONES,
 };
 
 /// Largest allowed size of an event file.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// Highest event version this app understands.
-pub const SUPPORTED_V: u32 = 2;
+pub const SUPPORTED_V: u32 = 3;
 /// Events that refer to uploaded files use this version, so that apps too old
 /// to handle files ignore them and ask for an update instead of rejecting them.
 pub const FILES_V: u32 = 2;
+/// Departments, parts, comments and requests that point at a department or a
+/// part use this version, for the same reason.
+pub const BOARD_V: u32 = 3;
 /// Highest folder format this app may write to.
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -40,10 +44,27 @@ pub struct CreatePayload {
     pub title: String,
     pub description: String,
     pub sim_type: String,
+    pub department: Option<Uuid>,
+    pub part: Option<Uuid>,
     pub priority: u8,
     pub requester: String,
     pub deadline: String,
     pub input: Option<Location>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeptPayload {
+    pub name: String,
+    pub color: u8,
+    pub zones: Vec<Zone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartPayload {
+    pub department: Uuid,
+    pub name: String,
+    pub status: PartStatus,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +93,16 @@ pub enum Action {
     Delete {
         note: String,
     },
+    /// A comment on a request.
+    Comment {
+        text: String,
+    },
+    /// Creates a department or replaces its name, colour and zones.
+    DeptSet(Box<DeptPayload>),
+    DeptDelete,
+    /// Creates a part or replaces its name, status and note.
+    PartSet(Box<PartPayload>),
+    PartDelete,
     /// Unknown `kind` or a higher `v` than the app knows: stored but has no effect.
     Unsupported,
     /// Known `kind` but invalid content: rejected at replay with this reason.
@@ -140,6 +171,42 @@ struct CreateWire {
     deadline: String,
     input_kind: String,
     input_ref: String,
+    #[serde(default)]
+    department: Option<Uuid>,
+    #[serde(default)]
+    part: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommentWire {
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ZoneWire {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeptWire {
+    name: String,
+    color: u8,
+    zones: Vec<ZoneWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartWire {
+    department: Uuid,
+    name: String,
+    status: String,
+    note: String,
 }
 
 #[derive(Deserialize)]
@@ -213,10 +280,57 @@ fn validate_create(w: CreateWire) -> Result<CreatePayload, String> {
         title: w.title,
         description: w.description,
         sim_type: w.sim_type,
+        department: w.department,
+        part: w.part,
         priority: w.priority,
         requester: w.requester,
         deadline: w.deadline,
         input,
+    })
+}
+
+fn validate_dept(w: DeptWire) -> Result<DeptPayload, String> {
+    check_text(t("namn", "name"), &w.name, MAX_DEPT_NAME, true)?;
+    if w.color >= COLOR_COUNT {
+        return Err(t("okänd färg", "unknown colour").to_string());
+    }
+    if w.zones.len() > MAX_ZONES {
+        return Err(t("för många zoner", "too many zones").to_string());
+    }
+    let zones: Vec<Zone> = w
+        .zones
+        .into_iter()
+        .map(|z| Zone {
+            x: z.x,
+            y: z.y,
+            w: z.w,
+            h: z.h,
+        })
+        .collect();
+    if zones.iter().any(|zone| !zone.valid()) {
+        return Err(t(
+            "en zon ligger utanför ritningen",
+            "a zone is outside the drawing",
+        )
+        .to_string());
+    }
+    Ok(DeptPayload {
+        name: w.name,
+        color: w.color,
+        zones,
+    })
+}
+
+fn validate_part(w: PartWire) -> Result<PartPayload, String> {
+    check_text(t("namn", "name"), &w.name, MAX_PART_NAME, true)?;
+    check_text(t("anteckning", "note"), &w.note, MAX_TEXT, false)?;
+    let status = PartStatus::parse(&w.status)
+        .ok_or_else(|| t("okänd status", "unknown status").to_string())?;
+    Ok(PartPayload {
+        department: w.department,
+        name: w.name,
+        status,
+        note: w.note,
     })
 }
 
@@ -271,6 +385,18 @@ fn parse_action(kind: &str, payload: Value) -> Action {
             check_text(t("anteckning", "note"), &w.note, MAX_TEXT, false)?;
             Ok(Action::Delete { note: w.note })
         }),
+        OpKind::Comment => from_payload::<CommentWire>(payload).and_then(|w| {
+            check_text(t("kommentar", "comment"), &w.text, MAX_TEXT, true)?;
+            Ok(Action::Comment { text: w.text })
+        }),
+        OpKind::DeptSet => from_payload::<DeptWire>(payload)
+            .and_then(validate_dept)
+            .map(|p| Action::DeptSet(Box::new(p))),
+        OpKind::DeptDelete => from_payload::<EmptyWire>(payload).map(|_| Action::DeptDelete),
+        OpKind::PartSet => from_payload::<PartWire>(payload)
+            .and_then(validate_part)
+            .map(|p| Action::PartSet(Box::new(p))),
+        OpKind::PartDelete => from_payload::<EmptyWire>(payload).map(|_| Action::PartDelete),
     };
     result.unwrap_or_else(|e| Action::Invalid(truncate_chars(&e, 300)))
 }
@@ -316,12 +442,19 @@ impl Op {
             ));
         }
         let mut action = parse_action(&w.kind, w.payload);
-        if v < FILES_V && action.uses_file() {
+        if v < action.min_version() {
             action = Action::Invalid(
-                t(
-                    "uppladdade filer kräver en nyare händelseversion",
-                    "uploaded files require a newer event version",
-                )
+                if action.uses_file() && v < FILES_V {
+                    t(
+                        "uppladdade filer kräver en nyare händelseversion",
+                        "uploaded files require a newer event version",
+                    )
+                } else {
+                    t(
+                        "innehållet kräver en nyare händelseversion",
+                        "the content requires a newer event version",
+                    )
+                }
                 .to_string(),
             );
         }
@@ -364,6 +497,8 @@ pub enum NewAction {
         title: String,
         description: String,
         sim_type: String,
+        department: Option<Uuid>,
+        part: Option<Uuid>,
         priority: u8,
         requester: String,
         deadline: String,
@@ -389,6 +524,24 @@ pub enum NewAction {
     Delete {
         note: String,
     },
+    Comment {
+        text: String,
+    },
+    /// Creates or replaces the department with the given id.
+    DeptSet {
+        name: String,
+        color: u8,
+        zones: Vec<Zone>,
+    },
+    DeptDelete,
+    /// Creates or replaces the part with the given id.
+    PartSet {
+        department: Uuid,
+        name: String,
+        status: PartStatus,
+        note: String,
+    },
+    PartDelete,
 }
 
 fn loc_wire(loc: &Option<Location>) -> (&str, &str) {
@@ -409,6 +562,20 @@ impl Action {
             Action::Create(p) => is_file(&p.input),
             Action::Finish(p) => p.report.kind == LocKind::File || is_file(&p.results),
             _ => false,
+        }
+    }
+
+    /// The lowest event version that may carry this action.
+    pub fn min_version(&self) -> u32 {
+        match self {
+            Action::Comment { .. }
+            | Action::DeptSet(_)
+            | Action::DeptDelete
+            | Action::PartSet(_)
+            | Action::PartDelete => BOARD_V,
+            Action::Create(p) if p.department.is_some() || p.part.is_some() => BOARD_V,
+            _ if self.uses_file() => FILES_V,
+            _ => 1,
         }
     }
 }
@@ -434,6 +601,26 @@ impl NewAction {
             NewAction::Cancel { .. } => OpKind::Cancel,
             NewAction::Requeue => OpKind::Requeue,
             NewAction::Delete { .. } => OpKind::Delete,
+            NewAction::Comment { .. } => OpKind::Comment,
+            NewAction::DeptSet { .. } => OpKind::DeptSet,
+            NewAction::DeptDelete => OpKind::DeptDelete,
+            NewAction::PartSet { .. } => OpKind::PartSet,
+            NewAction::PartDelete => OpKind::PartDelete,
+        }
+    }
+
+    fn version(&self) -> u32 {
+        match self {
+            NewAction::Comment { .. }
+            | NewAction::DeptSet { .. }
+            | NewAction::DeptDelete
+            | NewAction::PartSet { .. }
+            | NewAction::PartDelete => BOARD_V,
+            NewAction::Create {
+                department, part, ..
+            } if department.is_some() || part.is_some() => BOARD_V,
+            _ if self.uses_file() => FILES_V,
+            _ => 1,
         }
     }
 
@@ -443,13 +630,15 @@ impl NewAction {
                 title,
                 description,
                 sim_type,
+                department,
+                part,
                 priority,
                 requester,
                 deadline,
                 input,
             } => {
                 let (input_kind, input_ref) = loc_wire(input);
-                json!({
+                let mut payload = json!({
                     "title": title,
                     "description": description,
                     "sim_type": sim_type,
@@ -458,7 +647,16 @@ impl NewAction {
                     "deadline": deadline,
                     "input_kind": input_kind,
                     "input_ref": input_ref,
-                })
+                });
+                // Only written when set, so that requests without them stay
+                // readable for older apps.
+                if let Some(department) = department {
+                    payload["department"] = json!(department);
+                }
+                if let Some(part) = part {
+                    payload["part"] = json!(part);
+                }
+                payload
             }
             NewAction::Take { assignee } => json!({ "assignee": assignee }),
             NewAction::Finish {
@@ -481,7 +679,27 @@ impl NewAction {
             NewAction::Fail { note } | NewAction::Cancel { note } | NewAction::Delete { note } => {
                 json!({ "note": note })
             }
-            NewAction::Requeue => json!({}),
+            NewAction::Requeue | NewAction::DeptDelete | NewAction::PartDelete => json!({}),
+            NewAction::Comment { text } => json!({ "text": text }),
+            NewAction::DeptSet { name, color, zones } => json!({
+                "name": name,
+                "color": color,
+                "zones": zones
+                    .iter()
+                    .map(|z| json!({ "x": z.x, "y": z.y, "w": z.w, "h": z.h }))
+                    .collect::<Vec<_>>(),
+            }),
+            NewAction::PartSet {
+                department,
+                name,
+                status,
+                note,
+            } => json!({
+                "department": department,
+                "name": name,
+                "status": status.as_str(),
+                "note": note,
+            }),
         }
     }
 }
@@ -496,7 +714,7 @@ pub fn build_op(
     action: &NewAction,
 ) -> Result<Op, String> {
     let wire = WireOp {
-        v: if action.uses_file() { FILES_V } else { 1 },
+        v: action.version(),
         op_id: Uuid::new_v4(),
         client_id,
         hlc,
@@ -1211,6 +1429,8 @@ mod tests {
             title: "T".to_string(),
             description: String::new(),
             sim_type: String::new(),
+            department: None,
+            part: None,
             priority: 2,
             requester: "A".to_string(),
             deadline: String::new(),
@@ -1248,6 +1468,166 @@ mod tests {
         assert!(matches!(
             Op::parse(&value.to_string()).unwrap().action,
             Action::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn departments_parts_and_comments_use_the_board_version() {
+        let client = Uuid::new_v4();
+        let dept_id = Uuid::new_v4();
+        let zone = Zone {
+            x: 70,
+            y: 30,
+            w: 140,
+            h: 110,
+        };
+        let dept = build_op(
+            client,
+            hlc(1, 0),
+            "A",
+            dept_id,
+            &NewAction::DeptSet {
+                name: "Aero".to_string(),
+                color: 3,
+                zones: vec![zone],
+            },
+        )
+        .unwrap();
+        assert_eq!(dept.v, BOARD_V);
+        assert!(
+            matches!(&dept.action, Action::DeptSet(p) if p.zones == vec![zone] && p.color == 3)
+        );
+
+        let part = build_op(
+            client,
+            hlc(2, 0),
+            "A",
+            Uuid::new_v4(),
+            &NewAction::PartSet {
+                department: dept_id,
+                name: "Bakvinge".to_string(),
+                status: PartStatus::Simulation,
+                note: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(part.v, BOARD_V);
+        assert!(matches!(&part.action, Action::PartSet(p) if p.status == PartStatus::Simulation));
+
+        let comment = build_op(
+            client,
+            hlc(3, 0),
+            "A",
+            Uuid::new_v4(),
+            &NewAction::Comment {
+                text: "Vilket lastfall?".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(comment.v, BOARD_V);
+
+        // A request that points at a department needs the board version too,
+        // one without stays at version 1 and has no extra fields.
+        let mut create = create_action("T");
+        if let NewAction::Create { department, .. } = &mut create {
+            *department = Some(dept_id);
+        }
+        let with_dept = build_op(client, hlc(4, 0), "A", Uuid::new_v4(), &create).unwrap();
+        assert_eq!(with_dept.v, BOARD_V);
+        assert!(matches!(&with_dept.action, Action::Create(p) if p.department == Some(dept_id)));
+        let plain = build_op(client, hlc(5, 0), "A", Uuid::new_v4(), &create_action("T")).unwrap();
+        assert_eq!(plain.v, 1);
+        assert!(!plain.json.contains("department"));
+
+        for op in [&dept, &part, &comment, &with_dept] {
+            let mut value: Value = serde_json::from_str(&op.json).unwrap();
+            value["v"] = json!(1);
+            assert!(matches!(
+                Op::parse(&value.to_string()).unwrap().action,
+                Action::Invalid(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn hostile_board_content_is_rejected() {
+        let op = sample_op();
+        let board = |kind: &str, payload: Value| {
+            let mut value: Value = serde_json::from_str(&op.json).unwrap();
+            value["v"] = json!(BOARD_V);
+            value["kind"] = json!(kind);
+            value["payload"] = payload;
+            Op::parse(&value.to_string()).unwrap().action
+        };
+        let zone = |x: i64, y: i64, w: i64, h: i64| json!({"x": x, "y": y, "w": w, "h": h});
+        let dept = |name: &str, color: i64, zones: Vec<Value>| {
+            board(
+                "dept_set",
+                json!({"name": name, "color": color, "zones": zones}),
+            )
+        };
+        assert!(matches!(dept("Aero", 0, vec![]), Action::DeptSet(_)));
+        assert!(matches!(
+            dept("Aero", 9, vec![zone(0, 0, 1000, 600)]),
+            Action::DeptSet(_)
+        ));
+        assert!(matches!(dept("  ", 0, vec![]), Action::Invalid(_)));
+        assert!(matches!(
+            dept(&"x".repeat(MAX_DEPT_NAME + 1), 0, vec![]),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(dept("Aero", 10, vec![]), Action::Invalid(_)));
+        assert!(matches!(dept("Aero", -1, vec![]), Action::Invalid(_)));
+        assert!(matches!(
+            dept("Aero", 0, vec![zone(990, 0, 20, 20)]),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            dept("Aero", 0, vec![zone(0, 0, 5, 5)]),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            dept("Aero", 0, vec![zone(0, 0, 70000, 20)]),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            dept("Aero", 0, vec![zone(0, 0, 20, 20); MAX_ZONES + 1]),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            board(
+                "dept_set",
+                json!({"name": "Aero", "color": 0, "zones": [], "x": 1})
+            ),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            board("dept_delete", json!({"note": "x"})),
+            Action::Invalid(_)
+        ));
+
+        let part = |department: &str, status: &str| {
+            board(
+                "part_set",
+                json!({"department": department, "name": "Vinge", "status": status, "note": ""}),
+            )
+        };
+        let id = Uuid::new_v4().to_string();
+        assert!(matches!(part(&id, "design"), Action::PartSet(_)));
+        assert!(matches!(part(&id, "klar"), Action::Invalid(_)));
+        assert!(matches!(part("inte-ett-id", "design"), Action::Invalid(_)));
+
+        assert!(matches!(
+            board("comment", json!({"text": "  "})),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            board("comment", json!({"text": "x".repeat(MAX_TEXT + 1)})),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            board("comment", json!({"text": "Hej"})),
+            Action::Comment { .. }
         ));
     }
 }

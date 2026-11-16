@@ -16,6 +16,8 @@
 
 ![SimQ with the queue on the left and a request open on the right](docs/screenshot.jpg)
 
+- **The car at a glance.** An overview page shows a drawing of the car where every department marks its zones and tracks its parts.
+- **Departments, filters and comments.** See who asks for what, filter the queue and discuss a request where it lives.
 - **Files included.** Upload CAD files and reports through the app, or just link to where they are.
 - **No server.** The team syncs through a private GitHub repository or a shared folder.
 - **Works offline.** Changes are sent when the network is back.
@@ -23,7 +25,7 @@
 - **Swedish and English.** Each person chooses their own language.
 - **A single file** for Windows, macOS and Linux. Nothing to install.
 
-**Contents:** [How it works](#how-it-works) · [Get started with GitHub](#get-started-with-github) · [Shared folder](#get-started-with-a-shared-folder-alternative) · [Download](#download-and-start) · [Updating](#updating) · [Good to know](#good-to-know) · [For developers](#for-developers)
+**Contents:** [How it works](#how-it-works) · [The overview](#the-overview) · [Get started with GitHub](#get-started-with-github) · [Shared folder](#get-started-with-a-shared-folder-alternative) · [Download](#download-and-start) · [Updating](#updating) · [Good to know](#good-to-know) · [For developers](#for-developers)
 
 SimQ does not run any simulations. You do the actual work as usual in Ansys, SolidWorks, Fusion or whatever you use. SimQ is only the queue and the notice board.
 
@@ -47,6 +49,31 @@ For every file (input, report, results) you choose how to point to it. You can u
 | Vault | A short description, e.g. `Uprights/v3/Assembly.iam` |
 | Other | Free text, e.g. `The USB stick in the workshop drawer` |
 | Upload file | Choose a file on your computer (at most 500 MB). Everyone on the team can then download it from the request |
+
+### Departments, filters and comments
+
+- **Department and part.** A new request can say which department asks for it and which part of the car it is about. Both are optional.
+- **Filters.** Above the queue you can filter on department, simulation type, priority and person, show only your own requests, and search. Click a column heading to sort by it; click again to reverse, and a third time to go back to the usual order. Filters and sorting are yours alone and are not synced.
+- **Comments.** Open a request and write at the bottom of it. Questions and answers stay with the request.
+- **New for you.** A blue dot marks your own requests (the ones you created or took) that someone else has changed or commented on since you last opened them. The "New for you" filter shows only those.
+- **Duplicate.** A request cannot be edited, but **Duplicate…** opens a new one filled in from it.
+- **Export CSV.** Saves the list as it is shown, for Excel or a meeting. The file uses semicolons between the columns.
+
+## The overview
+
+![The overview: the car from the side and from above, with one coloured zone per department](docs/overview.jpg)
+
+The **Overview** page shows a drawing of a Formula Student car, from the side and from above. It is there to make the state of the car easy to see.
+
+1. **Add a department.** A department works like a folder. Type a name under "New department", or click **Add suggestions** to get Aero, Chassis, Suspension, Powertrain, Electronics and Battery with ready-made zones. Everything can be changed afterwards.
+2. **Place it on the car.** Open the department, click **Place on the car** and drag on the drawing to mark where it belongs. A department can have several zones, for example the front wing and the rear wing. Click the × in the corner of a zone to remove it, then **Save**.
+3. **Add its parts.** Each part has a status: Not started, Design, Simulation, Manufacturing or Done. Change it in the list as the work moves on. A part can also have a short note.
+
+The colour of a zone shows how far the department's parts have come, from red over amber to green. Grey means the department has no parts yet. Click a zone to open its department. From there you can also create a simulation request for the department or for one part, and see its open requests.
+
+The drawing itself is the same for every team, but the zones are your own, so they can follow your car and your organisation. Team members on a version older than 0.5.0 do not see departments, parts, comments or requests that belong to a department until they update.
+
+The **Statistics** page counts requests per status, department, simulation type and assignee, and shows the average wait and lead time.
 
 ## Get started with GitHub
 
@@ -133,7 +160,7 @@ With a shared folder: if the folder itself disappears (e.g. if Google Drive is n
 
 The repository (or the shared folder) has a folder `ops/` with one small file per event (request created, request taken and so on). **Never edit, move or delete those files by hand.** The whole list is derived from them, and the app itself never changes or deletes a file that already exists. If you remove a file, requests can disappear or change status for everyone.
 
-A request cannot be edited afterwards either. If something went wrong: delete the request and add a new one.
+A request cannot be edited afterwards either. If something went wrong: duplicate the request, correct the copy and delete the original. Departments and parts are different: their names, zones and statuses can be changed at any time, and the latest change wins.
 
 ### Uploaded files
 
@@ -151,6 +178,8 @@ Choose **Upload file** as the kind for the input when you create a request, or f
 Open the request and click **Delete…**. The request disappears from the list for everyone on the team, and this cannot be undone. Anyone with the team key can delete. Nothing is removed from the repository: the deletion is just another event, and deleted requests are listed under **Settings → Diagnostics**.
 
 Team members on a version older than 0.3.0 still see deleted requests until they update.
+
+Uploaded files that belonged only to deleted requests can be removed under **Settings → Diagnostics → Clean up the files…**. That removes them for everyone and cannot be undone.
 
 ### Backup
 
@@ -200,8 +229,9 @@ Keep the app's source code in a different repository from the team's data, and n
 ### How the sync works
 
 - Every change is a new file: `ops/YYYY-MM/<time>-<counter>_<client>_<id>.json`. No files are overwritten, so the content can never conflict.
+- Departments, parts and comments are events in the same log. Setting a department or a part replaces its content, so the latest event in the order wins; deleting one is final.
 - Every app replays all events in a fixed order (hybrid logical clock, then client ID and event ID) and builds its own local SQLite cache. The same files always give the same result.
 - With GitHub the app works against a local copy of `ops/`, and a background thread keeps the copy and the repository equal through the GitHub REST API: new files in the repository are downloaded, new local files are uploaded as one commit each. The team key is stored in plain text in the app's settings file on the computer.
 - Everything coming from outside is treated as untrusted input: files over 64 KiB, broken JSON, unknown fields and files with the wrong name or path are ignored. Only `http://` and `https://` links can be clicked.
 
-The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `blobs` (uploaded files), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui`.
+The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `blobs` (uploaded files), `export` (CSV and statistics), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui` (with `ui/overview` for the car and `ui/stats`).

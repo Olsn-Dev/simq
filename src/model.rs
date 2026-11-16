@@ -9,6 +9,17 @@ use crate::i18n::t;
 pub const MAX_TITLE: usize = 200;
 pub const MAX_NAME: usize = 200;
 pub const MAX_TEXT: usize = 4000;
+pub const MAX_DEPT_NAME: usize = 60;
+pub const MAX_PART_NAME: usize = 120;
+/// Most zones a department can have on the car drawing.
+pub const MAX_ZONES: usize = 16;
+/// The car drawing is this many units wide and high. Zones use the same units.
+pub const CANVAS_W: u16 = 1000;
+pub const CANVAS_H: u16 = 600;
+/// Smallest side of a zone.
+pub const MIN_ZONE: u16 = 12;
+/// Number of colours a department can choose between.
+pub const COLOR_COUNT: u8 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
@@ -55,6 +66,11 @@ pub enum OpKind {
     Cancel,
     Requeue,
     Delete,
+    Comment,
+    DeptSet,
+    DeptDelete,
+    PartSet,
+    PartDelete,
 }
 
 impl OpKind {
@@ -67,6 +83,11 @@ impl OpKind {
             OpKind::Cancel => "cancel",
             OpKind::Requeue => "requeue",
             OpKind::Delete => "delete",
+            OpKind::Comment => "comment",
+            OpKind::DeptSet => "dept_set",
+            OpKind::DeptDelete => "dept_delete",
+            OpKind::PartSet => "part_set",
+            OpKind::PartDelete => "part_delete",
         }
     }
 
@@ -79,6 +100,11 @@ impl OpKind {
             "cancel" => OpKind::Cancel,
             "requeue" => OpKind::Requeue,
             "delete" => OpKind::Delete,
+            "comment" => OpKind::Comment,
+            "dept_set" => OpKind::DeptSet,
+            "dept_delete" => OpKind::DeptDelete,
+            "part_set" => OpKind::PartSet,
+            "part_delete" => OpKind::PartDelete,
             _ => return None,
         })
     }
@@ -96,6 +122,11 @@ impl OpKind {
             OpKind::Cancel => t("Avbröt ärendet", "Cancelled the request"),
             OpKind::Requeue => t("Köade om ärendet", "Requeued the request"),
             OpKind::Delete => t("Tog bort ärendet", "Deleted the request"),
+            OpKind::Comment => t("Kommenterade", "Commented"),
+            OpKind::DeptSet => t("Ändrade avdelningen", "Changed the department"),
+            OpKind::DeptDelete => t("Tog bort avdelningen", "Deleted the department"),
+            OpKind::PartSet => t("Ändrade delen", "Changed the part"),
+            OpKind::PartDelete => t("Tog bort delen", "Deleted the part"),
         }
     }
 
@@ -112,6 +143,11 @@ impl OpKind {
             OpKind::Cancel => t("avbröt ärendet", "cancelled the request"),
             OpKind::Requeue => t("köade om ärendet", "requeued the request"),
             OpKind::Delete => t("tog bort ärendet", "deleted the request"),
+            OpKind::Comment => t("kommenterade", "commented"),
+            OpKind::DeptSet => t("ändrade avdelningen", "changed the department"),
+            OpKind::DeptDelete => t("tog bort avdelningen", "deleted the department"),
+            OpKind::PartSet => t("ändrade delen", "changed the part"),
+            OpKind::PartDelete => t("tog bort delen", "deleted the part"),
         }
     }
 }
@@ -319,6 +355,10 @@ pub struct Request {
     pub title: String,
     pub description: String,
     pub sim_type: String,
+    /// The department that asks for the simulation, if one was chosen.
+    pub department: Option<Uuid>,
+    /// The part of the car the simulation is about, if one was chosen.
+    pub part: Option<Uuid>,
     pub priority: u8,
     pub requester: String,
     pub deadline: String,
@@ -338,6 +378,129 @@ pub struct Request {
     /// Who last changed the request, and how.
     pub last_by: String,
     pub last_kind: OpKind,
+    pub comments: Vec<Comment>,
+    /// The app that created the request.
+    pub created_by: Uuid,
+    /// When the request last changed (comments included), and by which app.
+    pub changed_at: u64,
+    pub changed_by: Uuid,
+}
+
+/// A comment on a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    pub op_id: Uuid,
+    pub at_ms: u64,
+    pub by: String,
+    pub text: String,
+}
+
+/// A rectangle on the car drawing, in the drawing's own units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Zone {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl Zone {
+    pub fn valid(&self) -> bool {
+        self.w >= MIN_ZONE
+            && self.h >= MIN_ZONE
+            && u32::from(self.x) + u32::from(self.w) <= u32::from(CANVAS_W)
+            && u32::from(self.y) + u32::from(self.h) <= u32::from(CANVAS_H)
+    }
+}
+
+/// How far a part of the car has come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub enum PartStatus {
+    #[default]
+    NotStarted,
+    Design,
+    Simulation,
+    Manufacturing,
+    Done,
+}
+
+impl PartStatus {
+    pub const ALL: [PartStatus; 5] = [
+        PartStatus::NotStarted,
+        PartStatus::Design,
+        PartStatus::Simulation,
+        PartStatus::Manufacturing,
+        PartStatus::Done,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PartStatus::NotStarted => "not_started",
+            PartStatus::Design => "design",
+            PartStatus::Simulation => "simulation",
+            PartStatus::Manufacturing => "manufacturing",
+            PartStatus::Done => "done",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<PartStatus> {
+        PartStatus::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PartStatus::NotStarted => t("Ej påbörjad", "Not started"),
+            PartStatus::Design => "Design",
+            PartStatus::Simulation => t("Simulering", "Simulation"),
+            PartStatus::Manufacturing => t("Tillverkning", "Manufacturing"),
+            PartStatus::Done => t("Klar", "Done"),
+        }
+    }
+
+    /// 0 for not started up to 4 for done.
+    pub fn step(self) -> u32 {
+        self as u32
+    }
+}
+
+/// A department: a folder of parts with a name, a colour and zones on the car.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Department {
+    pub id: Uuid,
+    pub seq: u32,
+    pub name: String,
+    pub color: u8,
+    pub zones: Vec<Zone>,
+    pub created_at: u64,
+    pub changed_at: u64,
+    pub deleted_at: Option<u64>,
+    pub last_by: String,
+}
+
+/// A part of the car that a department keeps track of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    pub id: Uuid,
+    pub seq: u32,
+    pub department: Uuid,
+    pub name: String,
+    pub status: PartStatus,
+    pub note: String,
+    pub created_at: u64,
+    pub changed_at: u64,
+    pub deleted_at: Option<u64>,
+    pub last_by: String,
+}
+
+/// Share of the work that is done, 0.0 to 1.0, for a set of part statuses.
+/// `None` when there are no parts.
+pub fn progress(statuses: impl Iterator<Item = PartStatus>) -> Option<f32> {
+    let (mut sum, mut count) = (0u32, 0u32);
+    for status in statuses {
+        sum += status.step();
+        count += 1;
+    }
+    (count > 0).then(|| sum as f32 / (count * 4) as f32)
 }
 
 /// List order: in progress first, then queued by priority and oldest
@@ -402,6 +565,28 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(parse_location("other", &"x".repeat(MAX_TEXT + 1)).is_err());
+    }
+
+    #[test]
+    fn zones_and_progress() {
+        let zone = |x, y, w, h| Zone { x, y, w, h };
+        assert!(zone(0, 0, 1000, 600).valid());
+        assert!(zone(988, 588, 12, 12).valid());
+        assert!(!zone(989, 0, 12, 12).valid());
+        assert!(!zone(0, 0, 11, 50).valid());
+        assert!(!zone(0, 590, 50, 12).valid());
+        assert!(!zone(65535, 0, 65535, 12).valid());
+
+        assert_eq!(progress(std::iter::empty()), None);
+        assert_eq!(progress([PartStatus::Done].into_iter()), Some(1.0));
+        assert_eq!(
+            progress([PartStatus::NotStarted, PartStatus::Done].into_iter()),
+            Some(0.5)
+        );
+        for status in PartStatus::ALL {
+            assert_eq!(PartStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(PartStatus::parse("klar"), None);
     }
 
     #[test]
