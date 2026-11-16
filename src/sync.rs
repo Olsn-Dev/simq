@@ -838,6 +838,8 @@ pub enum Cmd {
         new_files: bool,
     },
     Rebuild,
+    /// Changes between light and dark mode: saved in the settings.
+    SetTheme(config::ThemeChoice),
     /// Changes language: saved in the settings and all texts are rebuilt.
     SetLanguage(Lang),
     Shutdown,
@@ -1021,6 +1023,10 @@ impl Worker {
                     if ok {
                         self.sync();
                     }
+                }
+                Ok(Cmd::SetTheme(theme)) => {
+                    self.config.theme = theme;
+                    let _ = config::save(&self.paths, &self.config);
                 }
                 Ok(Cmd::SetLanguage(lang)) => {
                     i18n::set(lang);
@@ -1844,6 +1850,7 @@ mod tests {
         let dept = applied(a.submit(
             None,
             &NewAction::DeptSet {
+                regions: Vec::new(),
                 name: "Aero".to_string(),
                 color: 0,
                 zones: vec![zone],
@@ -1883,6 +1890,7 @@ mod tests {
         let late = b.submit(
             Some(dept),
             &NewAction::DeptSet {
+                regions: Vec::new(),
                 name: "Aero 2".to_string(),
                 color: 1,
                 zones: Vec::new(),

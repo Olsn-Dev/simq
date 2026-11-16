@@ -256,6 +256,7 @@ mod tests {
             1,
             dept,
             &NewAction::DeptSet {
+                regions: Vec::new(),
                 name: "Aero".to_string(),
                 color: 0,
                 zones: Vec::new(),

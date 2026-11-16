@@ -61,17 +61,17 @@ For every file (input, report, results) you choose how to point to it. You can u
 
 ## The overview
 
-![The overview: the car from the side and from above, with one coloured zone per department](docs/overview.jpg)
+![The overview: the car from the side and from above, with the parts of the Aero department lit up](docs/overview.jpg)
 
-The **Overview** page shows a drawing of a Formula Student car, from the side and from above. It is there to make the state of the car easy to see.
+The **Overview** page shows a drawing of a formula car, from the side and from above. It is there to make the state of the car easy to see.
 
-1. **Add a department.** A department works like a folder. Type a name under "New department", or click **Add suggestions** to get Aero, Chassis, Suspension, Powertrain, Electronics and Battery with ready-made zones. Everything can be changed afterwards.
-2. **Place it on the car.** Open the department, click **Place on the car** and drag on the drawing to mark where it belongs. A department can have several zones, for example the front wing and the rear wing. Click the × in the corner of a zone to remove it, then **Save**.
-3. **Add its parts.** Each part has a status: Not started, Design, Simulation, Manufacturing or Done. Change it in the list as the work moves on. A part can also have a short note.
+1. **Add a department.** A department works like a folder. Type a name under "New department", or click **Add suggestions** to get Aero, Chassis, Suspension, Powertrain and Electronics, already placed on the car. Everything can be changed afterwards.
+2. **Place it on the car.** Click the parts of the car that belong to the department: front wing, nose, front suspension, front wheels, monocoque and cockpit, sidepods, floor, engine cover, rear suspension, rear wheels and rear wing. Each part follows the shape of the car and is the same part in both views. A department can have several parts, and a part belongs to one department at a time. Click a part again to remove it, then **Save**. A new department goes straight to this step.
+3. **Add its parts.** Each part in the list has a status: Not started, Design, Simulation, Manufacturing or Done. Change it as the work moves on. A part can also have a short note.
 
-The colour of a zone shows how far the department's parts have come, from red over amber to green. Grey means the department has no parts yet. Click a zone to open its department. From there you can also create a simulation request for the department or for one part, and see its open requests.
+The colour of a department's shapes shows how far its parts have come, from red over amber to green. Grey means the department has no parts yet. Point at a shape to light up everything that belongs to the same department, in both views. Click it to open the department. From there you can also create a simulation request for the department or for one part, and see its open requests. A click between the shapes does nothing.
 
-The drawing itself is the same for every team, but the zones are your own, so they can follow your car and your organisation. Team members on a version older than 0.5.0 do not see departments, parts, comments or requests that belong to a department until they update.
+Team members on a version older than 0.5.1 do not see departments that are placed on the car until they update. Zones drawn as rectangles in version 0.5.0 are no longer shown: place those departments again.
 
 The **Statistics** page counts requests per status, department, simulation type and assignee, and shows the average wait and lead time.
 
@@ -117,6 +117,8 @@ Get the latest version for your system under **Releases** on the GitHub page:
 The app is a single self-contained file. Nothing needs to be installed.
 
 The first time, you choose language (**Svenska** or **English**), display name and how the app should sync. Each person chooses their own language, and the team can mix freely. Everything can be changed later under **Settings**.
+
+The app follows the computer's light or dark mode. The sun and moon button at the top right switches between them, and **Settings → Appearance** has all three choices.
 
 ### The app is not signed
 
@@ -218,6 +220,8 @@ A new release is built automatically for Windows, macOS and Linux when a tag sta
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
+The car on the overview page is `assets/car.png`: white line art on a transparent background, tinted by the app for light and dark mode. The clickable parts are outlines traced over it in `src/ui/car.rs`, in the picture's own pixel coordinates.
+
 The app icon is drawn by a script. To change it, edit `tools/make_icon.py` and run it (requires Pillow):
 
 ```bash
@@ -234,4 +238,4 @@ Keep the app's source code in a different repository from the team's data, and n
 - With GitHub the app works against a local copy of `ops/`, and a background thread keeps the copy and the repository equal through the GitHub REST API: new files in the repository are downloaded, new local files are uploaded as one commit each. The team key is stored in plain text in the app's settings file on the computer.
 - Everything coming from outside is treated as untrusted input: files over 64 KiB, broken JSON, unknown fields and files with the wrong name or path are ignored. Only `http://` and `https://` links can be clicked.
 
-The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `blobs` (uploaded files), `export` (CSV and statistics), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui` (with `ui/overview` for the car and `ui/stats`).
+The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `blobs` (uploaded files), `export` (CSV and statistics), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui` (with `ui/overview` and `ui/car` for the car and `ui/stats`).

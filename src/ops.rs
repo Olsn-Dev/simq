@@ -15,21 +15,23 @@ use uuid::Uuid;
 use crate::hlc::Hlc;
 use crate::i18n::{is_en, t};
 use crate::model::{
-    char_len, parse_location, truncate_chars, valid_deadline, LocKind, Location, OpKind,
-    PartStatus, Zone, COLOR_COUNT, MAX_DEPT_NAME, MAX_NAME, MAX_PART_NAME, MAX_TEXT, MAX_TITLE,
-    MAX_ZONES,
+    char_len, parse_location, truncate_chars, valid_deadline, valid_region_id, LocKind, Location,
+    OpKind, PartStatus, Zone, COLOR_COUNT, MAX_DEPT_NAME, MAX_NAME, MAX_PART_NAME, MAX_REGIONS,
+    MAX_TEXT, MAX_TITLE, MAX_ZONES,
 };
 
 /// Largest allowed size of an event file.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// Highest event version this app understands.
-pub const SUPPORTED_V: u32 = 3;
+pub const SUPPORTED_V: u32 = 4;
 /// Events that refer to uploaded files use this version, so that apps too old
 /// to handle files ignore them and ask for an update instead of rejecting them.
 pub const FILES_V: u32 = 2;
 /// Departments, parts, comments and requests that point at a department or a
 /// part use this version, for the same reason.
 pub const BOARD_V: u32 = 3;
+/// Departments that point at regions of the car drawing use this version.
+pub const REGIONS_V: u32 = 4;
 /// Highest folder format this app may write to.
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -57,6 +59,7 @@ pub struct DeptPayload {
     pub name: String,
     pub color: u8,
     pub zones: Vec<Zone>,
+    pub regions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +201,8 @@ struct DeptWire {
     name: String,
     color: u8,
     zones: Vec<ZoneWire>,
+    #[serde(default)]
+    regions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +299,9 @@ fn validate_dept(w: DeptWire) -> Result<DeptPayload, String> {
     if w.color >= COLOR_COUNT {
         return Err(t("okänd färg", "unknown colour").to_string());
     }
+    if w.regions.len() > MAX_REGIONS || w.regions.iter().any(|id| !valid_region_id(id)) {
+        return Err(t("ogiltigt område på bilen", "invalid region of the car").to_string());
+    }
     if w.zones.len() > MAX_ZONES {
         return Err(t("för många zoner", "too many zones").to_string());
     }
@@ -318,6 +326,7 @@ fn validate_dept(w: DeptWire) -> Result<DeptPayload, String> {
         name: w.name,
         color: w.color,
         zones,
+        regions: w.regions,
     })
 }
 
@@ -532,6 +541,7 @@ pub enum NewAction {
         name: String,
         color: u8,
         zones: Vec<Zone>,
+        regions: Vec<String>,
     },
     DeptDelete,
     /// Creates or replaces the part with the given id.
@@ -569,10 +579,11 @@ impl Action {
     pub fn min_version(&self) -> u32 {
         match self {
             Action::Comment { .. }
-            | Action::DeptSet(_)
             | Action::DeptDelete
             | Action::PartSet(_)
             | Action::PartDelete => BOARD_V,
+            Action::DeptSet(p) if !p.regions.is_empty() => REGIONS_V,
+            Action::DeptSet(_) => BOARD_V,
             Action::Create(p) if p.department.is_some() || p.part.is_some() => BOARD_V,
             _ if self.uses_file() => FILES_V,
             _ => 1,
@@ -612,10 +623,11 @@ impl NewAction {
     fn version(&self) -> u32 {
         match self {
             NewAction::Comment { .. }
-            | NewAction::DeptSet { .. }
             | NewAction::DeptDelete
             | NewAction::PartSet { .. }
             | NewAction::PartDelete => BOARD_V,
+            NewAction::DeptSet { regions, .. } if !regions.is_empty() => REGIONS_V,
+            NewAction::DeptSet { .. } => BOARD_V,
             NewAction::Create {
                 department, part, ..
             } if department.is_some() || part.is_some() => BOARD_V,
@@ -681,14 +693,27 @@ impl NewAction {
             }
             NewAction::Requeue | NewAction::DeptDelete | NewAction::PartDelete => json!({}),
             NewAction::Comment { text } => json!({ "text": text }),
-            NewAction::DeptSet { name, color, zones } => json!({
-                "name": name,
-                "color": color,
-                "zones": zones
-                    .iter()
-                    .map(|z| json!({ "x": z.x, "y": z.y, "w": z.w, "h": z.h }))
-                    .collect::<Vec<_>>(),
-            }),
+            NewAction::DeptSet {
+                name,
+                color,
+                zones,
+                regions,
+            } => {
+                let mut payload = json!({
+                    "name": name,
+                    "color": color,
+                    "zones": zones
+                        .iter()
+                        .map(|z| json!({ "x": z.x, "y": z.y, "w": z.w, "h": z.h }))
+                        .collect::<Vec<_>>(),
+                });
+                // Only written when set, so that departments without regions
+                // stay readable for version 0.5.0.
+                if !regions.is_empty() {
+                    payload["regions"] = json!(regions);
+                }
+                payload
+            }
             NewAction::PartSet {
                 department,
                 name,
@@ -1487,6 +1512,7 @@ mod tests {
             "A",
             dept_id,
             &NewAction::DeptSet {
+                regions: Vec::new(),
                 name: "Aero".to_string(),
                 color: 3,
                 zones: vec![zone],
@@ -1628,6 +1654,60 @@ mod tests {
         assert!(matches!(
             board("comment", json!({"text": "Hej"})),
             Action::Comment { .. }
+        ));
+    }
+
+    #[test]
+    fn regions_of_the_car_need_their_own_event_version() {
+        let client = Uuid::new_v4();
+        let dept = |regions: &[&str]| NewAction::DeptSet {
+            name: "Aero".to_string(),
+            color: 0,
+            zones: Vec::new(),
+            regions: regions.iter().map(|r| r.to_string()).collect(),
+        };
+        // Without regions the event stays readable for version 0.5.0.
+        let plain = build_op(client, hlc(1, 0), "A", Uuid::new_v4(), &dept(&[])).unwrap();
+        assert_eq!(plain.v, BOARD_V);
+        assert!(!plain.json.contains("regions"));
+
+        let placed = build_op(
+            client,
+            hlc(2, 0),
+            "A",
+            Uuid::new_v4(),
+            &dept(&["front_wing", "rear_wing"]),
+        )
+        .unwrap();
+        assert_eq!(placed.v, REGIONS_V);
+        assert!(
+            matches!(&placed.action, Action::DeptSet(p) if p.regions == ["front_wing", "rear_wing"])
+        );
+        let mut value: Value = serde_json::from_str(&placed.json).unwrap();
+        value["v"] = json!(BOARD_V);
+        assert!(matches!(
+            Op::parse(&value.to_string()).unwrap().action,
+            Action::Invalid(_)
+        ));
+
+        // A region this app does not know is kept, a malformed one is refused.
+        let with = |regions: Value| {
+            let mut value: Value = serde_json::from_str(&placed.json).unwrap();
+            value["payload"]["regions"] = regions;
+            Op::parse(&value.to_string()).unwrap().action
+        };
+        assert!(matches!(
+            with(json!(["from_a_newer_app"])),
+            Action::DeptSet(_)
+        ));
+        assert!(matches!(with(json!(["Front Wing"])), Action::Invalid(_)));
+        assert!(matches!(with(json!(["../x"])), Action::Invalid(_)));
+        assert!(matches!(with(json!([""])), Action::Invalid(_)));
+        assert!(matches!(with(json!(["x".repeat(33)])), Action::Invalid(_)));
+        assert!(matches!(with(json!([1])), Action::Invalid(_)));
+        assert!(matches!(
+            with(json!(vec!["a"; MAX_REGIONS + 1])),
+            Action::Invalid(_)
         ));
     }
 }

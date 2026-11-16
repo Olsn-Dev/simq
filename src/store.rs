@@ -23,7 +23,7 @@ use crate::model::{Department, Location, Part, Request};
 use crate::ops::Op;
 use crate::replay::{sort_ops, Outcome, State};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS departments (
     name       TEXT NOT NULL,
     color      INTEGER NOT NULL,
     zones      TEXT NOT NULL,
+    regions    TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     changed_at INTEGER NOT NULL,
     deleted_at INTEGER
@@ -600,8 +601,8 @@ fn write_department(conn: &Connection, d: &Department) -> Result<(), StoreError>
     let zones: Vec<[u16; 4]> = d.zones.iter().map(|z| [z.x, z.y, z.w, z.h]).collect();
     conn.prepare_cached(
         "INSERT OR REPLACE INTO departments (
-             id, seq, name, color, zones, created_at, changed_at, deleted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             id, seq, name, color, zones, created_at, changed_at, deleted_at, regions)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?
     .execute(params![
         d.id.to_string(),
@@ -612,6 +613,7 @@ fn write_department(conn: &Connection, d: &Department) -> Result<(), StoreError>
         millis(d.created_at),
         millis(d.changed_at),
         d.deleted_at.map(millis),
+        d.regions.join(","),
     ])?;
     Ok(())
 }
@@ -750,6 +752,7 @@ mod tests {
                 names[i],
                 dept,
                 &NewAction::DeptSet {
+                    regions: Vec::new(),
                     name: name.to_string(),
                     color: i as u8,
                     zones: vec![zone; i],

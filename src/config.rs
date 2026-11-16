@@ -9,6 +9,30 @@ use uuid::Uuid;
 use crate::github::GithubConfig;
 use crate::i18n::{t, Lang};
 
+/// Light or dark mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    Light,
+    Dark,
+    /// Follow the computer's setting (also for unknown values in the configuration file).
+    #[default]
+    #[serde(other)]
+    System,
+}
+
+impl ThemeChoice {
+    pub const ALL: [ThemeChoice; 3] = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeChoice::System => t("Som datorn", "Same as the computer"),
+            ThemeChoice::Light => t("Ljust", "Light"),
+            ThemeChoice::Dark => t("Mörkt", "Dark"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -20,6 +44,8 @@ pub struct Config {
     pub display_name: String,
     #[serde(default)]
     pub language: Lang,
+    #[serde(default)]
+    pub theme: ThemeChoice,
     pub client_id: Uuid,
 }
 
@@ -30,6 +56,7 @@ impl Config {
             github: None,
             display_name: String::new(),
             language: Lang::default(),
+            theme: ThemeChoice::default(),
             client_id: Uuid::new_v4(),
         }
     }
@@ -244,6 +271,16 @@ mod tests {
         std::fs::write(&paths.config_file, old).unwrap();
         let loaded = load_or_init(&paths).unwrap();
         assert_eq!(loaded.language, Lang::Sv);
+        // The same goes for light or dark mode: it follows the computer.
+        assert_eq!(loaded.theme, ThemeChoice::System);
+        let mut config = loaded.clone();
+        config.theme = ThemeChoice::Dark;
+        save(&paths, &config).unwrap();
+        assert_eq!(load_or_init(&paths).unwrap().theme, ThemeChoice::Dark);
+        assert_eq!(
+            serde_json::from_str::<ThemeChoice>("\"sepia\"").unwrap(),
+            ThemeChoice::System
+        );
         assert_eq!(loaded.client_id, config.client_id);
     }
 

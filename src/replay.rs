@@ -213,6 +213,7 @@ impl State {
                     dept.name = payload.name.clone();
                     dept.color = payload.color;
                     dept.zones = payload.zones.clone();
+                    dept.regions = payload.regions.clone();
                     dept.changed_at = at;
                     dept.last_by = op.by.clone();
                 } else {
@@ -225,6 +226,7 @@ impl State {
                             name: payload.name.clone(),
                             color: payload.color,
                             zones: payload.zones.clone(),
+                            regions: payload.regions.clone(),
                             created_at: at,
                             changed_at: at,
                             deleted_at: None,
@@ -251,6 +253,7 @@ impl State {
                             name: String::new(),
                             color: 0,
                             zones: Vec::new(),
+                            regions: Vec::new(),
                             created_at: at,
                             changed_at: at,
                             deleted_at: Some(at),
@@ -918,6 +921,7 @@ mod tests {
 
     fn dept(name: &str, zones: Vec<crate::model::Zone>) -> NewAction {
         NewAction::DeptSet {
+            regions: Vec::new(),
             name: name.to_string(),
             color: 1,
             zones,

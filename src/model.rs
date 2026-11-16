@@ -18,6 +18,9 @@ pub const CANVAS_W: u16 = 1000;
 pub const CANVAS_H: u16 = 600;
 /// Smallest side of a zone.
 pub const MIN_ZONE: u16 = 12;
+/// Most car regions a department can have, and the longest region id.
+pub const MAX_REGIONS: usize = 32;
+pub const MAX_REGION_ID: usize = 32;
 /// Number of colours a department can choose between.
 pub const COLOR_COUNT: u8 = 10;
 
@@ -413,6 +416,16 @@ impl Zone {
     }
 }
 
+/// True for a well-formed region id: lower-case letters, digits and `_`.
+/// Ids this app does not know are kept, so that newer apps can add regions.
+pub fn valid_region_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REGION_ID
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// How far a part of the car has come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub enum PartStatus {
@@ -470,7 +483,11 @@ pub struct Department {
     pub seq: u32,
     pub name: String,
     pub color: u8,
+    /// Rectangles from version 0.5.0. Kept so that old data stays valid, but
+    /// no longer shown: the regions below replaced them.
     pub zones: Vec<Zone>,
+    /// Ids of the parts of the car drawing that belong to the department.
+    pub regions: Vec<String>,
     pub created_at: u64,
     pub changed_at: u64,
     pub deleted_at: Option<u64>,

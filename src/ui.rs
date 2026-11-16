@@ -13,11 +13,12 @@ use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
+mod car;
 mod overview;
 mod stats;
 
 use crate::blobs::{self, FileRef};
-use crate::config::{Config, Paths};
+use crate::config::{Config, Paths, ThemeChoice};
 use crate::github::{GithubRemote, RemoteState, RemoteStatus, RemoteStore};
 use crate::i18n::{self, is_en, t, Lang};
 use crate::model::{
@@ -584,6 +585,8 @@ impl App {
             update_manual: false,
             downloads: Vec::new(),
         };
+        app.board.drawing = car::load_drawing(&app.ctx);
+        apply_theme(&app.ctx, app.config.theme);
         // Look for a newer version once at start-up (not from the tests: it uses the network).
         if !cfg!(test) {
             app.check_for_update(false);
@@ -1152,6 +1155,13 @@ impl App {
         }
     }
 
+    /// Changes between light and dark mode. The background thread saves the choice.
+    fn set_theme(&mut self, theme: ThemeChoice) {
+        apply_theme(&self.ctx, theme);
+        self.config.theme = theme;
+        self.handle.send(Cmd::SetTheme(theme));
+    }
+
     /// Changes language immediately in the interface. The background thread saves the choice.
     fn set_language(&mut self, lang: Lang) {
         i18n::set(lang);
@@ -1193,6 +1203,17 @@ impl App {
                 let current = self.config.language == lang;
                 if ui.selectable_label(current, lang.name()).clicked() && !current {
                     self.set_language(lang);
+                }
+            }
+        });
+        ui.add_space(10.0);
+
+        ui.label(RichText::new(t("Utseende", "Appearance")).strong());
+        ui.horizontal(|ui| {
+            for theme in ThemeChoice::ALL {
+                let current = self.config.theme == theme;
+                if ui.selectable_label(current, theme.label()).clicked() && !current {
+                    self.set_theme(theme);
                 }
             }
         });
@@ -1413,6 +1434,23 @@ impl App {
                         if ui.button(t("Inställningar", "Settings")).clicked() {
                             self.settings_open = true;
                             self.identity.saved = false;
+                        }
+                        // Shows what a click switches to.
+                        let dark = ui.visuals().dark_mode;
+                        if ui
+                            .button(if dark { "☀" } else { "🌙" })
+                            .on_hover_text(if dark {
+                                t("Byt till ljust läge", "Switch to light mode")
+                            } else {
+                                t("Byt till mörkt läge", "Switch to dark mode")
+                            })
+                            .clicked()
+                        {
+                            self.set_theme(if dark {
+                                ThemeChoice::Light
+                            } else {
+                                ThemeChoice::Dark
+                            });
                         }
                         if ui.button(t("Synka nu", "Sync now")).clicked() {
                             self.handle.send(Cmd::SyncNow);
@@ -2658,6 +2696,14 @@ impl eframe::App for App {
 // Free-standing helper functions
 // ---------------------------------------------------------------------------
 
+fn apply_theme(ctx: &egui::Context, theme: ThemeChoice) {
+    ctx.set_theme(match theme {
+        ThemeChoice::System => egui::ThemePreference::System,
+        ThemeChoice::Light => egui::ThemePreference::Light,
+        ThemeChoice::Dark => egui::ThemePreference::Dark,
+    });
+}
+
 /// The status bar when the app syncs with GitHub.
 fn remote_status_ui(ui: &mut egui::Ui, remote: &RemoteStatus) {
     let (color, text) = match &remote.state {
@@ -3267,14 +3313,10 @@ mod tests {
         let dept = applied(bo.submit(
             None,
             &NewAction::DeptSet {
+                regions: vec!["front_wing".to_string(), "rear_wing".to_string()],
                 name: "Aero".to_string(),
                 color: 0,
-                zones: vec![crate::model::Zone {
-                    x: 75,
-                    y: 35,
-                    w: 125,
-                    h: 115,
-                }],
+                zones: Vec::new(),
             },
         ));
         let part = applied(bo.submit(
@@ -3313,6 +3355,7 @@ mod tests {
             github: None,
             display_name: "Anna".to_string(),
             language: Lang::Sv,
+            theme: ThemeChoice::System,
             client_id: me,
         };
         let paths = Paths {

@@ -1,6 +1,6 @@
-//! The overview: a drawing of a Formula Student car where every department
-//! marks its own zones. A department works like a folder of parts, and the
-//! colour of its zones shows how far the parts have come.
+//! The overview: a drawing of the car where every department owns the parts
+//! of the car it is responsible for. A department works like a folder of
+//! parts, and the colour of its regions shows how far the parts have come.
 
 use std::sync::Arc;
 
@@ -10,11 +10,12 @@ use eframe::egui::{
 };
 use uuid::Uuid;
 
+use super::car::{self, Car, Outline, Region};
 use super::{App, Confirm, ConfirmWhat, Pending, UiAction};
 use crate::i18n::{is_en, t};
 use crate::model::{
-    clean_text, one_line, progress, truncate_chars, Department, Part, PartStatus, Zone, CANVAS_H,
-    CANVAS_W, COLOR_COUNT, MAX_DEPT_NAME, MAX_PART_NAME, MAX_TEXT, MAX_ZONES,
+    clean_text, one_line, progress, truncate_chars, Department, Part, PartStatus, COLOR_COUNT,
+    MAX_DEPT_NAME, MAX_PART_NAME, MAX_TEXT,
 };
 use crate::ops::NewAction;
 use crate::sync::Snapshot;
@@ -27,9 +28,15 @@ pub(super) struct BoardUi {
     new_dept: String,
     new_part: String,
     text_edit: Option<TextEdit>,
-    zone_edit: Option<ZoneEdit>,
+    place: Option<Place>,
+    /// A department that was just created: as soon as it has been saved the
+    /// user gets to choose its regions.
+    place_after: Option<Uuid>,
     /// Where the car was drawn in the last frame.
     canvas: Option<Rect>,
+    car: Car,
+    /// The line art of the car, loaded when the app starts.
+    pub(super) drawing: Option<egui::TextureHandle>,
 }
 
 /// A name or note being edited in place.
@@ -46,12 +53,10 @@ enum EditWhat {
     PartNote,
 }
 
-/// The zones of a department while the user is placing them on the car.
-struct ZoneEdit {
+/// The regions of a department while the user is choosing them on the car.
+struct Place {
     dept: Uuid,
-    zones: Vec<Zone>,
-    /// Where the current drag started, in the drawing's units.
-    drag_from: Option<(f32, f32)>,
+    regions: Vec<String>,
 }
 
 /// What the user did in the overview during a frame.
@@ -64,58 +69,30 @@ enum BoardAction {
     AddPart(Uuid, String),
     SetPart(Part),
     DeletePart(Uuid),
-    EditZones(Uuid),
-    SaveZones,
-    CancelZones,
+    Place(Uuid),
+    SavePlace,
+    CancelPlace,
     EditText(Uuid, EditWhat, String),
     SaveText,
     CancelText,
 }
 
-/// Suggested departments with zones that fit the drawing: (Swedish, English, zones).
-const SUGGESTED: [(&str, &str, &[[u16; 4]]); 6] = [
-    (
-        "Aero",
-        "Aero",
-        &[
-            [75, 35, 125, 115],
-            [795, 195, 170, 50],
-            [75, 325, 125, 230],
-            [805, 315, 145, 250],
-        ],
-    ),
-    (
-        "Chassi",
-        "Chassis",
-        &[[470, 92, 190, 72], [405, 400, 350, 80]],
-    ),
+/// Suggested departments: (Swedish, English, regions of the car).
+const SUGGESTED: [(&str, &str, &[&str]); 5] = [
+    ("Aero", "Aero", &["front_wing", "rear_wing", "floor"]),
+    ("Chassi", "Chassis", &["monocoque", "nose"]),
     (
         "Hjulupphängning",
         "Suspension",
         &[
-            [200, 155, 100, 100],
-            [670, 155, 100, 100],
-            [200, 322, 100, 56],
-            [200, 502, 100, 56],
-            [670, 330, 100, 52],
-            [670, 498, 100, 52],
+            "front_suspension",
+            "rear_suspension",
+            "front_wheels",
+            "rear_wheels",
         ],
     ),
-    (
-        "Drivlina",
-        "Powertrain",
-        &[[305, 152, 85, 72], [205, 405, 190, 70]],
-    ),
-    (
-        "Elektronik",
-        "Electronics",
-        &[[400, 172, 95, 50], [400, 354, 200, 44]],
-    ),
-    (
-        "Batteri",
-        "Battery",
-        &[[500, 172, 95, 50], [400, 482, 200, 44]],
-    ),
+    ("Drivlina", "Powertrain", &["engine_cover"]),
+    ("Elektronik", "Electronics", &["sidepods"]),
 ];
 
 /// Maps between the drawing's units and the screen.
@@ -132,44 +109,13 @@ impl Map {
         )
     }
 
-    fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> Rect {
-        Rect::from_min_max(self.pt(x, y), self.pt(x + w, y + h))
-    }
-
-    fn zone(&self, z: &Zone) -> Rect {
-        self.rect(
-            f32::from(z.x),
-            f32::from(z.y),
-            f32::from(z.w),
-            f32::from(z.h),
-        )
-    }
-
-    /// A screen position in the drawing's units, kept inside the drawing.
+    /// A screen position in the drawing's units.
     fn canvas(&self, p: Pos2) -> (f32, f32) {
         (
-            ((p.x - self.origin.x) / self.scale).clamp(0.0, f32::from(CANVAS_W)),
-            ((p.y - self.origin.y) / self.scale).clamp(0.0, f32::from(CANVAS_H)),
+            (p.x - self.origin.x) / self.scale,
+            (p.y - self.origin.y) / self.scale,
         )
     }
-}
-
-fn zone_between(a: (f32, f32), b: (f32, f32)) -> Zone {
-    let (x0, x1) = (a.0.min(b.0).round(), a.0.max(b.0).round());
-    let (y0, y1) = (a.1.min(b.1).round(), a.1.max(b.1).round());
-    Zone {
-        x: x0 as u16,
-        y: y0 as u16,
-        w: (x1 - x0) as u16,
-        h: (y1 - y0) as u16,
-    }
-}
-
-fn contains(zone: &Zone, at: (f32, f32)) -> bool {
-    at.0 >= f32::from(zone.x)
-        && at.0 <= f32::from(zone.x + zone.w)
-        && at.1 >= f32::from(zone.y)
-        && at.1 <= f32::from(zone.y + zone.h)
 }
 
 fn parts_of(snapshot: &Snapshot, dept: Uuid) -> impl Iterator<Item = &Part> {
@@ -187,6 +133,22 @@ fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
+/// The department that owns a region. If two departments claim the same
+/// region (they were placed at the same moment), the older one has it.
+fn owner<'a>(snapshot: &'a Snapshot, region: &str) -> Option<&'a Department> {
+    snapshot
+        .departments
+        .iter()
+        .find(|d| d.regions.iter().any(|r| r == region))
+}
+
+/// The regions of the drawing that a department has, in the drawing's order.
+fn regions_of<'a>(car: &'a Car, dept: &'a Department) -> impl Iterator<Item = &'a Region> {
+    car.regions
+        .iter()
+        .filter(move |r| dept.regions.iter().any(|id| id == r.id))
+}
+
 impl App {
     pub(super) fn overview_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
         let snapshot = Arc::clone(&self.snapshot);
@@ -197,8 +159,16 @@ impl App {
         if self.board.selected.is_some_and(|id| !live(id)) {
             self.board.selected = None;
         }
-        if self.board.zone_edit.as_ref().is_some_and(|e| !live(e.dept)) {
-            self.board.zone_edit = None;
+        if self.board.place.as_ref().is_some_and(|e| !live(e.dept)) {
+            self.board.place = None;
+        }
+        // A new department goes straight to choosing its regions.
+        if let Some(id) = self.board.place_after.filter(|id| live(*id)) {
+            self.board.place_after = None;
+            self.board.place = Some(Place {
+                dept: id,
+                regions: Vec::new(),
+            });
         }
 
         let mut out = Vec::new();
@@ -240,6 +210,7 @@ impl App {
             name: d.name.clone(),
             color: d.color,
             zones: d.zones.clone(),
+            regions: d.regions.clone(),
         };
         let set_part = |p: &Part| NewAction::PartSet {
             department: p.department,
@@ -265,32 +236,27 @@ impl App {
                         name,
                         color,
                         zones: Vec::new(),
+                        regions: Vec::new(),
                     },
                     Vec::new(),
                     Pending::Other,
                 );
                 self.board.new_dept.clear();
                 self.board.selected = Some(id);
+                self.board.place_after = Some(id);
             }
             BoardAction::AddSuggested => {
                 let items = SUGGESTED
                     .iter()
                     .enumerate()
-                    .map(|(i, (sv, en, zones))| {
+                    .map(|(i, (sv, en, regions))| {
                         (
                             Uuid::new_v4(),
                             NewAction::DeptSet {
                                 name: t(sv, en).to_string(),
                                 color: i as u8,
-                                zones: zones
-                                    .iter()
-                                    .map(|[x, y, w, h]| Zone {
-                                        x: *x,
-                                        y: *y,
-                                        w: *w,
-                                        h: *h,
-                                    })
-                                    .collect(),
+                                zones: Vec::new(),
+                                regions: regions.iter().map(|id| id.to_string()).collect(),
                             },
                         )
                     })
@@ -358,21 +324,21 @@ impl App {
                     });
                 }
             }
-            BoardAction::EditZones(id) => {
+            BoardAction::Place(id) => {
                 if let Some(d) = dept(id) {
-                    self.board.zone_edit = Some(ZoneEdit {
+                    self.board.selected = Some(id);
+                    self.board.place = Some(Place {
                         dept: id,
-                        zones: d.zones.clone(),
-                        drag_from: None,
+                        regions: d.regions.clone(),
                     });
                 }
             }
-            BoardAction::SaveZones => {
-                if let Some(edit) = self.board.zone_edit.take() {
-                    if let Some(d) = dept(edit.dept) {
-                        if d.zones != edit.zones {
+            BoardAction::SavePlace => {
+                if let Some(place) = self.board.place.take() {
+                    if let Some(d) = dept(place.dept) {
+                        if d.regions != place.regions {
                             let changed = Department {
-                                zones: edit.zones,
+                                regions: place.regions,
                                 ..d.clone()
                             };
                             self.submit(Some(d.id), set_dept(&changed), Vec::new(), Pending::Other);
@@ -380,7 +346,7 @@ impl App {
                     }
                 }
             }
-            BoardAction::CancelZones => self.board.zone_edit = None,
+            BoardAction::CancelPlace => self.board.place = None,
             BoardAction::EditText(target, what, text) => {
                 self.board.text_edit = Some(TextEdit { target, what, text });
             }
@@ -522,8 +488,8 @@ fn dept_list_ui(
                 egui::Button::new(t("Lägg till förslag", "Add suggestions")),
             )
             .on_hover_text(t(
-                "Skapar Aero, Chassi, Hjulupphängning, Drivlina, Elektronik och Batteri med färdiga zoner. Allt kan ändras efteråt.",
-                "Creates Aero, Chassis, Suspension, Powertrain, Electronics and Battery with ready-made zones. Everything can be changed afterwards.",
+                "Skapar Aero, Chassi, Hjulupphängning, Drivlina och Elektronik, redan placerade på bilen. Allt kan ändras efteråt.",
+                "Creates Aero, Chassis, Suspension, Powertrain and Electronics, already placed on the car. Everything can be changed afterwards.",
             ))
             .on_disabled_hover_text(why)
             .clicked()
@@ -561,7 +527,7 @@ fn dept_list_ui(
                         format!("{done} av {total} delar klara")
                     });
                 });
-                if dept.zones.is_empty() {
+                if regions_of(&board.car, dept).next().is_none() {
                     ui.weak(t("Inte placerad på bilen", "Not placed on the car"));
                 }
             })
@@ -648,19 +614,32 @@ fn dept_ui(
             });
         }
     });
+    let placed: Vec<&str> = regions_of(&board.car, dept).map(|r| r.label()).collect();
+    ui.add(
+        egui::Label::new(
+            RichText::new(if placed.is_empty() {
+                t("Inte placerad på bilen", "Not placed on the car").to_string()
+            } else {
+                format!("{}: {}", t("På bilen", "On the car"), placed.join(", "))
+            })
+            .size(12.5)
+            .color(ui.visuals().weak_text_color()),
+        )
+        .wrap(),
+    );
     ui.add_space(6.0);
     ui.add_enabled_ui(can_write, |ui| {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .button(t("Placera på bilen", "Place on the car"))
                 .on_hover_text(t(
-                    "Markera var på ritningen avdelningen hör hemma",
-                    "Mark where on the drawing the department belongs",
+                    "Välj vilka delar av bilen som hör till avdelningen",
+                    "Choose which parts of the car belong to the department",
                 ))
                 .on_disabled_hover_text(why)
                 .clicked()
             {
-                out.push(BoardAction::EditZones(dept.id));
+                out.push(BoardAction::Place(dept.id));
             }
             if ui.button(t("Byt namn", "Rename")).clicked() {
                 out.push(BoardAction::EditText(
@@ -886,6 +865,101 @@ fn dept_ui(
 // The car
 // ---------------------------------------------------------------------------
 
+/// How strongly a region is drawn.
+struct Look {
+    fill: u8,
+    line: f32,
+    line_alpha: u8,
+    glow: bool,
+}
+
+const IDLE: Look = Look {
+    fill: 13,
+    line: 1.0,
+    line_alpha: 105,
+    glow: false,
+};
+const HOVERED: Look = Look {
+    fill: 44,
+    line: 2.0,
+    line_alpha: 255,
+    glow: true,
+};
+const SELECTED: Look = Look {
+    fill: 58,
+    line: 2.5,
+    line_alpha: 255,
+    glow: false,
+};
+
+fn paint_outline(
+    painter: &egui::Painter,
+    map: &Map,
+    outline: &Outline,
+    color: Color32,
+    look: &Look,
+) {
+    let points: Vec<Pos2> = outline.points.iter().map(|(x, y)| map.pt(*x, *y)).collect();
+    if look.fill > 0 {
+        // The same opacity looks stronger on a dark background.
+        let dark = painter.ctx().style().visuals.dark_mode;
+        let alpha = if dark {
+            (u16::from(look.fill) * 6 / 10) as u8
+        } else {
+            look.fill
+        };
+        let fill = with_alpha(color, alpha.max(1));
+        let mut mesh = egui::Mesh::default();
+        for point in &points {
+            mesh.colored_vertex(*point, fill);
+        }
+        for [a, b, c] in &outline.triangles {
+            mesh.add_triangle(*a, *b, *c);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    if look.glow {
+        for (extra, alpha) in [(7.0, 34), (3.5, 70)] {
+            painter.add(egui::Shape::closed_line(
+                points.clone(),
+                Stroke::new(look.line + extra, with_alpha(color, alpha)),
+            ));
+        }
+    }
+    painter.add(egui::Shape::closed_line(
+        points,
+        Stroke::new(look.line, with_alpha(color, look.line_alpha)),
+    ));
+}
+
+fn paint_region(painter: &egui::Painter, map: &Map, region: &Region, color: Color32, look: &Look) {
+    for outline in &region.outlines {
+        paint_outline(painter, map, outline, color, look);
+    }
+}
+
+/// A small name tag on the drawing.
+fn tag(painter: &egui::Painter, at: Pos2, text: &str, visuals: &egui::Visuals) {
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        FontId::proportional(12.5),
+        visuals.strong_text_color(),
+    );
+    let rect = Rect::from_center_size(at, galley.size() + egui::vec2(14.0, 6.0));
+    painter.rect(
+        rect,
+        CornerRadius::same(9),
+        visuals.window_fill,
+        visuals.window_stroke,
+        StrokeKind::Outside,
+    );
+    painter.galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        visuals.strong_text_color(),
+    );
+}
+
 fn canvas_ui(
     ui: &mut egui::Ui,
     board: &mut BoardUi,
@@ -894,11 +968,11 @@ fn canvas_ui(
     out: &mut Vec<BoardAction>,
 ) {
     let dark = ui.visuals().dark_mode;
-    if let Some(edit) = &board.zone_edit {
+    if let Some(place) = &board.place {
         let name = snapshot
             .departments
             .iter()
-            .find(|d| d.id == edit.dept)
+            .find(|d| d.id == place.dept)
             .map(|d| truncate_chars(&one_line(&d.name), 40))
             .unwrap_or_default();
         theme::card(ui).show(ui, |ui| {
@@ -906,205 +980,201 @@ fn canvas_ui(
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(name).strong());
                 ui.label(t(
-                    "Dra på bilen för att markera en zon. Klicka på × för att ta bort en.",
-                    "Drag on the car to mark a zone. Click × to remove one.",
+                    "Klicka på de delar av bilen som hör till avdelningen. Klicka igen för att ta bort en.",
+                    "Click the parts of the car that belong to the department. Click again to remove one.",
                 ));
                 if theme::add_primary(ui, can_write, t("Spara", "Save")).clicked() {
-                    out.push(BoardAction::SaveZones);
+                    out.push(BoardAction::SavePlace);
                 }
                 if ui.button(t("Avbryt", "Cancel")).clicked() {
-                    out.push(BoardAction::CancelZones);
-                }
-                if edit.zones.len() >= MAX_ZONES {
-                    ui.weak(t(
-                        "Största antalet zoner är nått.",
-                        "The largest number of zones is reached.",
-                    ));
+                    out.push(BoardAction::CancelPlace);
                 }
             });
         });
         ui.add_space(4.0);
     }
 
-    let available = ui.available_size();
-    let scale = (available.x / f32::from(CANVAS_W))
-        .min(available.y / f32::from(CANVAS_H))
-        .max(0.2);
+    let mut available = ui.available_size();
+    available.y = (available.y - 26.0).max(60.0);
+    let scale = (available.x / car::W).min(available.y / car::H).max(0.1);
     let (outer, _) = ui.allocate_exact_size(available, Sense::hover());
-    let rect = Rect::from_center_size(
-        outer.center(),
-        egui::vec2(f32::from(CANVAS_W) * scale, f32::from(CANVAS_H) * scale),
-    );
-    let response = ui.interact(rect, ui.id().with("car_canvas"), Sense::click_and_drag());
+    let rect = Rect::from_center_size(outer.center(), egui::vec2(car::W * scale, car::H * scale));
+    let response = ui.interact(rect, ui.id().with("car_canvas"), Sense::click());
     board.canvas = Some(rect);
     let map = Map {
         origin: rect.min,
         scale,
     };
-    let painter = ui.painter_at(rect.expand(2.0));
-    draw_car(&painter, &map, ui.visuals());
-    let pointer = response
+    let painter = ui.painter_at(rect.expand(8.0));
+    let visuals = ui.visuals().clone();
+    if let Some(drawing) = &board.drawing {
+        painter.image(
+            drawing.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            visuals
+                .text_color()
+                .gamma_multiply(if dark { 0.62 } else { 0.8 }),
+        );
+    }
+    for (y, text) in [
+        (12.0, t("FRÅN SIDAN", "FROM THE SIDE")),
+        (316.0, t("UPPIFRÅN", "FROM ABOVE")),
+    ] {
+        painter.text(
+            map.pt(16.0, y),
+            egui::Align2::LEFT_TOP,
+            text,
+            FontId::proportional(11.0),
+            visuals.weak_text_color(),
+        );
+    }
+    let hit = response
         .hover_pos()
         .or(response.interact_pointer_pos())
-        .map(|p| map.canvas(p));
-    let font = FontId::proportional((13.0 * scale.clamp(0.75, 1.3)).round());
-    let text_color = ui.visuals().strong_text_color();
+        .and_then(|p| board.car.hit(map.canvas(p)));
 
-    if let Some(edit) = board.zone_edit.as_mut() {
-        // The other departments stay visible, but faint.
-        let faint = with_alpha(ui.visuals().text_color(), 22);
-        for dept in snapshot.departments.iter().filter(|d| d.id != edit.dept) {
-            for zone in &dept.zones {
-                painter.rect_filled(map.zone(zone), CornerRadius::same(6), faint);
-            }
-        }
-        let color = snapshot
-            .departments
-            .iter()
-            .find(|d| d.id == edit.dept)
+    if let Some(place) = board.place.as_mut() {
+        let dept = snapshot.departments.iter().find(|d| d.id == place.dept);
+        let color = dept
             .map(|d| theme::dept_color(d.color, dark))
             .unwrap_or(theme::ACCENT);
-        let handle = |zone: &Zone| {
-            let r = map.zone(zone);
-            Pos2::new(r.right() - 12.0, r.top() + 12.0)
-        };
-        for zone in &edit.zones {
-            painter.rect(
-                map.zone(zone),
-                CornerRadius::same(6),
-                with_alpha(color, 70),
-                Stroke::new(2.0_f32, color),
-                StrokeKind::Inside,
-            );
-            painter.circle_filled(handle(zone), 9.0, ui.visuals().window_fill);
-            painter.circle_stroke(handle(zone), 9.0, Stroke::new(1.0_f32, color));
-            painter.text(
-                handle(zone),
-                egui::Align2::CENTER_CENTER,
-                "×",
-                FontId::proportional(14.0),
-                text_color,
-            );
-        }
-        if response.drag_started() {
-            // A drag is only noticed after the pointer has moved a little, so
-            // the zone starts where the button went down, not where it is now.
-            edit.drag_from = ui
-                .input(|i| i.pointer.press_origin())
-                .map(|p| map.canvas(p))
-                .or(pointer);
-        }
-        if let (Some(from), Some(to)) = (edit.drag_from, pointer) {
-            let zone = zone_between(from, to);
-            painter.rect(
-                map.zone(&zone),
-                CornerRadius::same(6),
-                with_alpha(color, 40),
-                Stroke::new(1.5_f32, color),
-                StrokeKind::Inside,
-            );
-            if response.drag_stopped() {
-                if zone.valid() && edit.zones.len() < MAX_ZONES {
-                    edit.zones.push(zone);
-                }
-                edit.drag_from = None;
+        let neutral = visuals.text_color();
+        // Who else has the region, if anyone.
+        let taken = |region: &Region| owner(snapshot, region.id).filter(|d| d.id != place.dept);
+        for region in &board.car.regions {
+            let hovered = hit.is_some_and(|h| h.id == region.id);
+            let mine = place.regions.iter().any(|id| id == region.id);
+            if mine {
+                paint_region(
+                    &painter,
+                    &map,
+                    region,
+                    color,
+                    if hovered { &HOVERED } else { &SELECTED },
+                );
+            } else if taken(region).is_some() {
+                let look = Look {
+                    fill: 12,
+                    line: 1.0,
+                    line_alpha: 60,
+                    glow: false,
+                };
+                paint_region(&painter, &map, region, neutral, &look);
+            } else {
+                let look = Look {
+                    fill: if hovered { 30 } else { 0 },
+                    line: if hovered { 2.0 } else { 1.0 },
+                    line_alpha: if hovered { 255 } else { 120 },
+                    glow: hovered,
+                };
+                paint_region(
+                    &painter,
+                    &map,
+                    region,
+                    if hovered { color } else { neutral },
+                    &look,
+                );
             }
-        } else if response.drag_stopped() {
-            edit.drag_from = None;
         }
-        if response.clicked() {
-            if let Some(at) = response.interact_pointer_pos() {
-                if let Some(index) = edit
-                    .zones
-                    .iter()
-                    .rposition(|zone| handle(zone).distance(at) <= 11.0)
-                {
-                    edit.zones.remove(index);
+        if let Some(region) = hit {
+            let other = taken(region);
+            let mine = place.regions.iter().any(|id| id == region.id);
+            let response = if other.is_none() {
+                response
+                    .clone()
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+            } else {
+                response.clone()
+            };
+            let clicked = response.clicked();
+            response.on_hover_ui_at_pointer(|ui| {
+                ui.label(RichText::new(region.label()).strong());
+                match other {
+                    Some(d) => ui.weak(format!(
+                        "{} {}",
+                        t("Hör till", "Belongs to"),
+                        truncate_chars(&one_line(&d.name), 40)
+                    )),
+                    None if mine => ui.weak(t("Klicka för att ta bort", "Click to remove")),
+                    None => ui.weak(t("Klicka för att lägga till", "Click to add")),
+                };
+            });
+            if clicked && other.is_none() {
+                if mine {
+                    place.regions.retain(|id| id != region.id);
+                } else {
+                    place.regions.push(region.id.to_string());
                 }
             }
         }
         return;
     }
 
-    // The zone under the pointer: the smallest one wins when zones overlap.
-    let hit = pointer.and_then(|at| {
-        snapshot
-            .departments
-            .iter()
-            .flat_map(|d| d.zones.iter().map(move |z| (d, z)))
-            .filter(|(_, z)| contains(z, at))
-            .min_by_key(|(_, z)| u32::from(z.w) * u32::from(z.h))
-            .map(|(d, _)| d)
-    });
+    let hovered_dept = hit.and_then(|region| owner(snapshot, region.id));
     for dept in &snapshot.departments {
         let (progress, _, _) = dept_progress(snapshot, dept.id);
         let color = theme::progress_color(progress, dark);
-        let active = board.selected == Some(dept.id) || hit.is_some_and(|d| d.id == dept.id);
-        for zone in &dept.zones {
-            let r = map.zone(zone);
-            painter.rect(
-                r,
-                CornerRadius::same(6),
-                with_alpha(color, if active { 90 } else { 44 }),
-                Stroke::new(if active { 2.5_f32 } else { 1.5_f32 }, color),
-                StrokeKind::Inside,
-            );
-            // The name, shortened until it fits, and the progress below it if there is room.
-            let name = one_line(&dept.name);
-            let fitted = (1..=name.chars().count()).rev().find_map(|n| {
-                let text = truncate_chars(&name, n);
-                let galley = painter.layout_no_wrap(text, font.clone(), text_color);
-                (galley.size().x <= r.width() - 8.0).then_some(galley)
-            });
-            if let Some(galley) = fitted.filter(|g| g.size().y <= r.height() - 4.0) {
-                let two_lines = r.height() >= galley.size().y * 2.0 + 8.0;
-                let mut top = r.center().y - galley.size().y / 2.0;
-                if two_lines {
-                    top -= galley.size().y / 2.0;
-                    painter.text(
-                        Pos2::new(r.center().x, top + galley.size().y),
-                        egui::Align2::CENTER_TOP,
-                        theme::percent_label(progress),
-                        font.clone(),
-                        text_color,
-                    );
-                }
-                painter.galley(
-                    Pos2::new(r.center().x - galley.size().x / 2.0, top),
-                    galley,
-                    text_color,
+        let selected = board.selected == Some(dept.id);
+        let hovered = hovered_dept.is_some_and(|d| d.id == dept.id);
+        let look = match (hovered, selected) {
+            (true, _) => &HOVERED,
+            (false, true) => &SELECTED,
+            _ => &IDLE,
+        };
+        // Only regions the department really has: one that is claimed twice
+        // is drawn for the older department alone.
+        for region in regions_of(&board.car, dept) {
+            if owner(snapshot, region.id).is_some_and(|d| d.id == dept.id) {
+                paint_region(&painter, &map, region, color, look);
+            }
+        }
+    }
+    // A part of the car that no department has yet: a faint outline on hover.
+    if let (Some(region), None) = (hit, hovered_dept) {
+        let look = Look {
+            fill: 7,
+            line: 1.0,
+            line_alpha: 150,
+            glow: false,
+        };
+        paint_region(&painter, &map, region, visuals.text_color(), &look);
+    }
+    // The selected department is named on the car, once per view.
+    if let Some(dept) = snapshot
+        .departments
+        .iter()
+        .find(|d| board.selected == Some(d.id))
+    {
+        let name = truncate_chars(&one_line(&dept.name), 28);
+        for side_view in [true, false] {
+            let largest = regions_of(&board.car, dept)
+                .filter(|r| owner(snapshot, r.id).is_some_and(|d| d.id == dept.id))
+                .filter_map(|r| r.largest(side_view))
+                .max_by(|a, b| a.area.total_cmp(&b.area));
+            if let Some(outline) = largest {
+                tag(
+                    &painter,
+                    map.pt(outline.center.0, outline.center.1),
+                    &name,
+                    &visuals,
                 );
             }
         }
     }
 
-    // Legend in the lower left corner.
-    let mut x = 24.0;
-    for (progress, label) in [
-        (None, t("inga delar", "no parts")),
-        (Some(0.0), "0 %"),
-        (Some(0.5), "50 %"),
-        (Some(1.0), "100 %"),
-    ] {
-        let at = map.pt(x, f32::from(CANVAS_H) - 14.0);
-        painter.circle_filled(at, 4.5, theme::progress_color(progress, dark));
-        let end = painter.text(
-            at + egui::vec2(9.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(11.5),
-            ui.visuals().weak_text_color(),
-        );
-        x = (end.right() - map.origin.x) / map.scale + 16.0 / map.scale;
-    }
-
-    if let Some(dept) = hit {
-        let (progress, _, total) = dept_progress(snapshot, dept.id);
-        response
-            .clone()
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_ui_at_pointer(|ui| {
+    if let Some(region) = hit {
+        let response = match hovered_dept {
+            Some(_) => response
+                .clone()
+                .on_hover_cursor(egui::CursorIcon::PointingHand),
+            None => response.clone(),
+        };
+        response.on_hover_ui_at_pointer(|ui| match hovered_dept {
+            Some(dept) => {
+                let (progress, _, total) = dept_progress(snapshot, dept.id);
                 ui.label(RichText::new(one_line(&dept.name)).strong());
+                ui.weak(region.label());
                 if total == 0 {
                     ui.weak(t("Inga delar än", "No parts yet"));
                 } else {
@@ -1121,187 +1191,49 @@ fn canvas_ui(
                         }
                     }
                 }
-            });
-    } else if snapshot.departments.iter().all(|d| d.zones.is_empty()) {
-        painter.text(
-            map.pt(f32::from(CANVAS_W) / 2.0, 284.0),
-            egui::Align2::CENTER_CENTER,
-            t(
-                "Inga zoner än. Välj en avdelning och klicka på \"Placera på bilen\".",
-                "No zones yet. Choose a department and click \"Place on the car\".",
-            ),
-            FontId::proportional(13.0),
-            ui.visuals().weak_text_color(),
-        );
+            }
+            None => {
+                ui.label(RichText::new(region.label()).strong());
+                ui.weak(t("Ingen avdelning än", "No department yet"));
+            }
+        });
     }
+    // Only a click on a department's own shape does something: a click
+    // between the parts or outside the car is ignored.
     if response.clicked() {
-        out.push(BoardAction::Select(hit.map(|d| d.id)));
-    }
-}
-
-/// A stylised Formula Student car: from the side at the top, from above below.
-fn draw_car(painter: &egui::Painter, map: &Map, visuals: &egui::Visuals) {
-    let ink = visuals.text_color().gamma_multiply(0.7);
-    let line = Stroke::new((1.6 * map.scale).clamp(1.0, 2.2), ink);
-    let thin = Stroke::new(1.0_f32, visuals.text_color().gamma_multiply(0.3));
-    let body = visuals.widgets.inactive.bg_fill;
-    let tyre = visuals.widgets.active.bg_fill;
-    let pts = |points: &[(f32, f32)]| -> Vec<Pos2> {
-        points.iter().map(|(x, y)| map.pt(*x, *y)).collect()
-    };
-    let polygon = |points: &[(f32, f32)], fill: Color32| {
-        painter.add(egui::Shape::convex_polygon(pts(points), fill, line));
-    };
-    let path = |points: &[(f32, f32)], stroke: Stroke| {
-        painter.add(egui::Shape::line(pts(points), stroke));
-    };
-    let seg = |a: (f32, f32), b: (f32, f32), stroke: Stroke| {
-        painter.line_segment([map.pt(a.0, a.1), map.pt(b.0, b.1)], stroke);
-    };
-    let boxed = |x: f32, y: f32, w: f32, h: f32, radius: u8, fill: Color32, stroke: Stroke| {
-        painter.rect(
-            map.rect(x, y, w, h),
-            CornerRadius::same(radius),
-            fill,
-            stroke,
-            StrokeKind::Inside,
-        );
-    };
-    let label = |x: f32, y: f32, text: &str| {
-        painter.text(
-            map.pt(x, y),
-            egui::Align2::LEFT_TOP,
-            text,
-            FontId::proportional(11.5),
-            visuals.weak_text_color(),
-        );
-    };
-
-    // ---- From the side (the nose points right) ----
-    label(24.0, 14.0, t("FRÅN SIDAN", "FROM THE SIDE"));
-    seg((40.0, 251.0), (960.0, 251.0), thin);
-    // Rear wing with its mount.
-    seg((165.0, 138.0), (215.0, 172.0), line);
-    boxed(85.0, 45.0, 105.0, 95.0, 4, body, line);
-    seg((97.0, 72.0), (178.0, 60.0), thin);
-    seg((97.0, 98.0), (178.0, 88.0), thin);
-    seg((97.0, 122.0), (178.0, 114.0), thin);
-    // Diffuser and undertray.
-    polygon(
-        &[
-            (180.0, 205.0),
-            (300.0, 225.0),
-            (300.0, 237.0),
-            (180.0, 222.0),
-        ],
-        body,
-    );
-    polygon(
-        &[
-            (300.0, 225.0),
-            (660.0, 225.0),
-            (650.0, 237.0),
-            (300.0, 237.0),
-        ],
-        body,
-    );
-    // Body.
-    polygon(
-        &[
-            (180.0, 225.0),
-            (180.0, 172.0),
-            (385.0, 150.0),
-            (560.0, 150.0),
-            (760.0, 172.0),
-            (885.0, 198.0),
-            (888.0, 212.0),
-            (800.0, 225.0),
-        ],
-        body,
-    );
-    // Main hoop with brace, front hoop, steering wheel and helmet.
-    path(&[(395.0, 150.0), (428.0, 60.0), (458.0, 150.0)], line);
-    seg((428.0, 60.0), (300.0, 159.0), thin);
-    path(&[(575.0, 150.0), (592.0, 118.0), (612.0, 153.0)], line);
-    seg((556.0, 140.0), (572.0, 116.0), line);
-    painter.circle(map.pt(478.0, 118.0), 22.0 * map.scale, body, line);
-    // Sidepod.
-    boxed(400.0, 172.0, 190.0, 48.0, 10, Color32::TRANSPARENT, thin);
-    // Suspension and wheels.
-    for (cx, arms) in [
-        (250.0, [(190.0, 182.0), (322.0, 176.0)]),
-        (720.0, [(650.0, 178.0), (790.0, 184.0)]),
-    ] {
-        for arm in arms {
-            seg((cx, 205.0), arm, thin);
+        if let Some(dept) = hovered_dept {
+            out.push(BoardAction::Select(Some(dept.id)));
         }
-        painter.circle(map.pt(cx, 205.0), 45.0 * map.scale, tyre, line);
-        painter.circle(map.pt(cx, 205.0), 22.0 * map.scale, body, thin);
     }
-    // Front wing.
-    polygon(
-        &[
-            (805.0, 213.0),
-            (955.0, 206.0),
-            (958.0, 238.0),
-            (805.0, 238.0),
-        ],
-        body,
-    );
-    seg((820.0, 222.0), (945.0, 216.0), thin);
-    seg((905.0, 209.0), (905.0, 238.0), thin);
 
-    // ---- From above ----
-    label(24.0, 296.0, t("UPPIFRÅN", "FROM ABOVE"));
-    // Wings.
-    boxed(85.0, 335.0, 105.0, 210.0, 4, body, line);
-    seg((120.0, 337.0), (120.0, 543.0), thin);
-    seg((155.0, 337.0), (155.0, 543.0), thin);
-    boxed(815.0, 325.0, 125.0, 230.0, 4, body, line);
-    seg((858.0, 327.0), (858.0, 553.0), thin);
-    seg((900.0, 327.0), (900.0, 553.0), thin);
-    // Suspension arms.
-    for (wheel, inner) in [
-        ((230.0, 372.0), (212.0, 410.0)),
-        ((275.0, 372.0), (300.0, 402.0)),
-        ((700.0, 376.0), (668.0, 410.0)),
-        ((745.0, 376.0), (772.0, 418.0)),
-    ] {
-        seg(wheel, inner, thin);
-        seg((wheel.0, 880.0 - wheel.1), (inner.0, 880.0 - inner.1), thin);
-    }
-    // Sidepods.
-    boxed(405.0, 358.0, 190.0, 38.0, 8, body, line);
-    boxed(405.0, 484.0, 190.0, 38.0, 8, body, line);
-    // Body.
-    polygon(
-        &[
-            (180.0, 408.0),
-            (400.0, 395.0),
-            (560.0, 395.0),
-            (760.0, 417.0),
-            (890.0, 433.0),
-            (890.0, 447.0),
-            (760.0, 463.0),
-            (560.0, 485.0),
-            (400.0, 485.0),
-            (180.0, 472.0),
-        ],
-        body,
-    );
-    // Cockpit and helmet.
-    boxed(425.0, 416.0, 150.0, 48.0, 14, Color32::TRANSPARENT, thin);
-    painter.circle(map.pt(478.0, 440.0), 19.0 * map.scale, body, line);
-    seg((585.0, 426.0), (585.0, 454.0), line);
-    // Wheels.
-    for (x, y, w, h) in [
-        (205.0, 328.0, 90.0, 44.0),
-        (205.0, 508.0, 90.0, 44.0),
-        (675.0, 336.0, 90.0, 40.0),
-        (675.0, 504.0, 90.0, 40.0),
-    ] {
-        boxed(x, y, w, h, 7, tyre, line);
-    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        let placed = snapshot
+            .departments
+            .iter()
+            .any(|d| regions_of(&board.car, d).next().is_some());
+        if !placed {
+            ui.weak(t(
+                "Ingen avdelning är placerad på bilen än. Öppna en avdelning och klicka på \"Placera på bilen\".",
+                "No department is placed on the car yet. Open a department and click \"Place on the car\".",
+            ));
+            return;
+        }
+        for (progress, label) in [
+            (None, t("inga delar", "no parts")),
+            (Some(0.0), "0 %"),
+            (Some(0.5), "50 %"),
+            (Some(1.0), "100 %"),
+        ] {
+            theme::dot(ui, theme::progress_color(progress, dark));
+            ui.label(
+                RichText::new(label)
+                    .size(11.5)
+                    .color(ui.visuals().weak_text_color()),
+            );
+            ui.add_space(8.0);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1311,8 +1243,8 @@ mod tests {
     use crate::sync::{Client, Submitted};
     use crate::testutil::TempDir;
 
-    /// A snapshot with two departments: one with a zone and two parts, one without zones.
-    fn snapshot(dir: &TempDir) -> (Snapshot, Uuid) {
+    /// A snapshot with Aero on both wings (two parts) and Chassis, which is not placed.
+    fn snapshot(dir: &TempDir) -> (Snapshot, Uuid, Uuid) {
         let mut client = Client::new(
             Store::open_in_memory().unwrap(),
             Uuid::new_v4(),
@@ -1327,30 +1259,31 @@ mod tests {
         let aero = add(NewAction::DeptSet {
             name: "Aero".to_string(),
             color: 0,
-            zones: vec![Zone {
-                x: 100,
-                y: 100,
-                w: 200,
-                h: 100,
-            }],
+            zones: Vec::new(),
+            regions: vec![
+                "front_wing".to_string(),
+                "rear_wing".to_string(),
+                "from_a_newer_app".to_string(),
+            ],
         });
-        add(NewAction::DeptSet {
-            name: "Chassi".to_string(),
+        let chassis = add(NewAction::DeptSet {
+            name: "Chassis".to_string(),
             color: 1,
             zones: Vec::new(),
+            regions: Vec::new(),
         });
         for (name, status) in [
-            ("Framvinge", PartStatus::Done),
-            ("Bakvinge", PartStatus::Design),
+            ("Front wing", PartStatus::Done),
+            ("Rear wing", PartStatus::Design),
         ] {
             add(NewAction::PartSet {
                 department: aero,
                 name: name.to_string(),
                 status,
-                note: "Väntar på kolfiber".to_string(),
+                note: "Waiting for carbon fibre".to_string(),
             });
         }
-        (client.snapshot(), aero)
+        (client.snapshot(), aero, chassis)
     }
 
     fn input(events: Vec<egui::Event>) -> egui::RawInput {
@@ -1358,15 +1291,6 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1400.0, 800.0))),
             events,
             ..Default::default()
-        }
-    }
-
-    fn button(pos: Pos2, pressed: bool) -> egui::Event {
-        egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
         }
     }
 
@@ -1390,143 +1314,113 @@ mod tests {
         out
     }
 
-    /// The screen position of a point given in the drawing's units.
-    fn at(board: &BoardUi, x: f32, y: f32) -> Pos2 {
+    /// Moves the pointer to a point of the drawing and clicks there.
+    fn click(
+        ctx: &egui::Context,
+        board: &mut BoardUi,
+        snapshot: &Snapshot,
+        x: f32,
+        y: f32,
+    ) -> Vec<BoardAction> {
         let rect = board.canvas.expect("the car has been drawn");
-        let scale = rect.width() / f32::from(CANVAS_W);
-        Pos2::new(rect.min.x + x * scale, rect.min.y + y * scale)
+        let scale = rect.width() / car::W;
+        let pos = Pos2::new(rect.min.x + x * scale, rect.min.y + y * scale);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(ctx, board, snapshot, vec![egui::Event::PointerMoved(pos)]);
+        frame(ctx, board, snapshot, vec![button(true)]);
+        frame(ctx, board, snapshot, vec![button(false)])
     }
 
     #[test]
-    fn clicking_a_zone_selects_its_department() {
+    fn only_a_click_on_a_departments_shape_selects_it() {
         let dir = TempDir::new();
-        let (snapshot, aero) = snapshot(&dir);
+        let (snapshot, aero, _) = snapshot(&dir);
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
         let mut board = BoardUi::default();
+        // Two frames: the side panel finds its width in the first one.
+        assert!(frame(&ctx, &mut board, &snapshot, Vec::new()).is_empty());
         assert!(frame(&ctx, &mut board, &snapshot, Vec::new()).is_empty());
         // The drawing keeps its proportions.
         let rect = board.canvas.unwrap();
-        assert!((rect.width() / rect.height() - 1000.0 / 600.0).abs() < 0.01);
+        assert!((rect.width() / rect.height() - car::W / car::H).abs() < 0.01);
 
-        let inside = at(&board, 200.0, 150.0);
-        frame(
-            &ctx,
-            &mut board,
-            &snapshot,
-            vec![egui::Event::PointerMoved(inside)],
-        );
-        frame(&ctx, &mut board, &snapshot, vec![button(inside, true)]);
-        let out = frame(&ctx, &mut board, &snapshot, vec![button(inside, false)]);
-        assert!(matches!(out[..], [BoardAction::Select(Some(id))] if id == aero));
-
-        // The department view with its parts renders, and a click beside the zones goes back.
+        // The rear wing from the side, and the front wing from above.
+        for (x, y) in [(1260.0, 130.0), (150.0, 420.0)] {
+            let out = click(&ctx, &mut board, &snapshot, x, y);
+            assert!(matches!(out[..], [BoardAction::Select(Some(id))] if id == aero));
+        }
+        // A part no department has, the gap between a wheel and the body, and
+        // the empty corner: nothing happens, and the selection stays.
         board.selected = Some(aero);
-        frame(&ctx, &mut board, &snapshot, Vec::new());
-        let outside = at(&board, 600.0, 280.0);
-        frame(
-            &ctx,
-            &mut board,
-            &snapshot,
-            vec![egui::Event::PointerMoved(outside)],
-        );
-        frame(&ctx, &mut board, &snapshot, vec![button(outside, true)]);
-        let out = frame(&ctx, &mut board, &snapshot, vec![button(outside, false)]);
-        assert!(matches!(out[..], [BoardAction::Select(None)]));
+        for (x, y) in [(345.0, 218.0), (460.0, 380.0), (20.0, 20.0)] {
+            assert!(
+                click(&ctx, &mut board, &snapshot, x, y).is_empty(),
+                "({x}, {y})"
+            );
+        }
+        assert_eq!(board.selected, Some(aero));
     }
 
     #[test]
-    fn zones_are_drawn_by_dragging_and_removed_with_the_cross() {
+    fn regions_are_chosen_by_clicking_and_taken_ones_are_left_alone() {
         let dir = TempDir::new();
-        let (snapshot, aero) = snapshot(&dir);
+        let (snapshot, aero, chassis) = snapshot(&dir);
         let ctx = egui::Context::default();
         let mut board = BoardUi {
-            selected: Some(aero),
-            zone_edit: Some(ZoneEdit {
-                dept: aero,
-                zones: snapshot.departments[0].zones.clone(),
-                drag_from: None,
+            selected: Some(chassis),
+            place: Some(Place {
+                dept: chassis,
+                regions: Vec::new(),
             }),
             ..BoardUi::default()
         };
         // Two frames: the banner above the car changes where the car ends up.
         frame(&ctx, &mut board, &snapshot, Vec::new());
         frame(&ctx, &mut board, &snapshot, Vec::new());
+        let chosen = |board: &BoardUi| board.place.as_ref().unwrap().regions.clone();
 
-        let (from, to) = (at(&board, 500.0, 320.0), at(&board, 700.0, 420.0));
-        frame(
-            &ctx,
-            &mut board,
-            &snapshot,
-            vec![egui::Event::PointerMoved(from)],
-        );
-        frame(&ctx, &mut board, &snapshot, vec![button(from, true)]);
-        let middle = from + (to - from) / 2.0;
-        frame(
-            &ctx,
-            &mut board,
-            &snapshot,
-            vec![egui::Event::PointerMoved(middle)],
-        );
-        frame(
-            &ctx,
-            &mut board,
-            &snapshot,
-            vec![egui::Event::PointerMoved(to)],
-        );
-        frame(&ctx, &mut board, &snapshot, vec![button(to, false)]);
-        let zones = board.zone_edit.as_ref().unwrap().zones.clone();
-        assert_eq!(zones.len(), 2, "the drag added a zone");
-        let new = zones[1];
-        assert!(new.valid());
-        assert!((i32::from(new.x) - 500).abs() <= 2 && (i32::from(new.y) - 320).abs() <= 2);
-        assert!((i32::from(new.w) - 200).abs() <= 3 && (i32::from(new.h) - 100).abs() <= 3);
+        // The monocoque from above, then the nose from the side: both are added.
+        click(&ctx, &mut board, &snapshot, 690.0, 540.0);
+        click(&ctx, &mut board, &snapshot, 250.0, 215.0);
+        assert_eq!(chosen(&board), ["monocoque", "nose"]);
+        // The front wing belongs to Aero and cannot be taken; empty space does nothing.
+        click(&ctx, &mut board, &snapshot, 150.0, 420.0);
+        click(&ctx, &mut board, &snapshot, 20.0, 20.0);
+        assert_eq!(chosen(&board), ["monocoque", "nose"]);
+        // A second click, in the other view, removes the region again.
+        click(&ctx, &mut board, &snapshot, 600.0, 120.0);
+        assert_eq!(chosen(&board), ["nose"]);
 
-        // A drag that is too small adds nothing.
-        let (from, to) = (at(&board, 800.0, 100.0), at(&board, 806.0, 160.0));
-        frame(
-            &ctx,
-            &mut board,
-            &snapshot,
-            vec![egui::Event::PointerMoved(from)],
-        );
-        frame(&ctx, &mut board, &snapshot, vec![button(from, true)]);
-        frame(
-            &ctx,
-            &mut board,
-            &snapshot,
-            vec![egui::Event::PointerMoved(to)],
-        );
-        frame(&ctx, &mut board, &snapshot, vec![button(to, false)]);
-        assert_eq!(board.zone_edit.as_ref().unwrap().zones.len(), 2);
-
-        // The cross in the corner of the first zone removes it.
-        let corner = at(&board, 300.0, 100.0) + egui::vec2(-12.0, 12.0);
-        frame(
-            &ctx,
-            &mut board,
-            &snapshot,
-            vec![egui::Event::PointerMoved(corner)],
-        );
-        frame(&ctx, &mut board, &snapshot, vec![button(corner, true)]);
-        frame(&ctx, &mut board, &snapshot, vec![button(corner, false)]);
-        assert_eq!(board.zone_edit.as_ref().unwrap().zones, vec![new]);
+        // Aero keeps the region it got from a newer app while its own are changed.
+        board.place = Some(Place {
+            dept: aero,
+            regions: snapshot.departments[0].regions.clone(),
+        });
+        frame(&ctx, &mut board, &snapshot, Vec::new());
+        click(&ctx, &mut board, &snapshot, 1260.0, 130.0);
+        assert_eq!(chosen(&board), ["front_wing", "from_a_newer_app"]);
     }
 
     #[test]
-    fn suggested_zones_fit_the_drawing() {
+    fn suggested_departments_use_every_region_once() {
+        let car = Car::new();
+        let mut used: Vec<&str> = SUGGESTED
+            .iter()
+            .flat_map(|(_, _, r)| r.iter().copied())
+            .collect();
         assert!(SUGGESTED.len() <= usize::from(COLOR_COUNT));
-        for (name, _, zones) in SUGGESTED {
-            assert!(zones.len() <= MAX_ZONES);
-            for [x, y, w, h] in zones {
-                let zone = Zone {
-                    x: *x,
-                    y: *y,
-                    w: *w,
-                    h: *h,
-                };
-                assert!(zone.valid(), "{name}: {zone:?}");
-            }
+        for id in &used {
+            assert!(car.region(id).is_some(), "{id}");
         }
+        used.sort_unstable();
+        let mut all: Vec<&str> = car.regions.iter().map(|r| r.id).collect();
+        all.sort_unstable();
+        assert_eq!(used, all);
     }
 }
