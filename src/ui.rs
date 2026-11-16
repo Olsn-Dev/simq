@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{Local, NaiveDate, TimeZone};
 use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 mod car;
@@ -47,8 +48,9 @@ const SIM_TYPES: [(&str, &str); 8] = [
 ];
 
 /// The three main views of the app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 enum View {
+    #[default]
     Queue,
     Overview,
     Stats,
@@ -65,7 +67,8 @@ enum Pending {
 }
 
 /// The filters above the queue. They are local to this app and never synced.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 struct Filters {
     /// `Some(None)` means requests without a department.
     department: Option<Option<Uuid>>,
@@ -94,7 +97,7 @@ impl Filters {
 }
 
 /// A column the queue can be sorted by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum SortCol {
     Seq,
     Title,
@@ -105,6 +108,136 @@ enum SortCol {
     Requester,
     Assignee,
     Deadline,
+}
+
+/// What the app remembers between starts, besides the window itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct Remembered {
+    view: View,
+    tab: Tab,
+    filters: Filters,
+    sort: Option<(SortCol, bool)>,
+}
+
+const REMEMBERED_KEY: &str = "simq-view";
+
+/// A message in the corner that goes away by itself.
+struct Toast {
+    title: String,
+    text: String,
+    shown: std::time::Instant,
+}
+
+const TOAST_SECONDS: f32 = 6.0;
+
+/// A column of the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Col {
+    Seq,
+    Title,
+    Department,
+    Type,
+    Priority,
+    Status,
+    Requester,
+    Assignee,
+    Deadline,
+    Links,
+}
+
+impl Col {
+    /// In the order they are shown.
+    const ALL: [Col; 10] = [
+        Col::Seq,
+        Col::Title,
+        Col::Department,
+        Col::Type,
+        Col::Priority,
+        Col::Status,
+        Col::Requester,
+        Col::Assignee,
+        Col::Deadline,
+        Col::Links,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Col::Seq => "#",
+            Col::Title => t("Titel", "Title"),
+            Col::Department => t("Avdelning", "Department"),
+            Col::Type => t("Typ", "Type"),
+            Col::Priority => t("Prioritet", "Priority"),
+            Col::Status => "Status",
+            Col::Requester => t("Beställare", "Requester"),
+            Col::Assignee => t("Utförare", "Assignee"),
+            Col::Deadline => "Deadline",
+            Col::Links => t("Rapport / resultat", "Report / results"),
+        }
+    }
+
+    /// Width to start with. The title takes what is left over.
+    fn width(self) -> f32 {
+        match self {
+            Col::Seq => 40.0,
+            Col::Title => 190.0,
+            Col::Priority => 72.0,
+            Col::Deadline => 92.0,
+            Col::Links => 122.0,
+            Col::Status => 108.0,
+            _ => 116.0,
+        }
+    }
+
+    fn sort(self) -> Option<SortCol> {
+        Some(match self {
+            Col::Seq => SortCol::Seq,
+            Col::Title => SortCol::Title,
+            Col::Department => SortCol::Department,
+            Col::Type => SortCol::Type,
+            Col::Priority => SortCol::Priority,
+            Col::Status => SortCol::Status,
+            Col::Requester => SortCol::Requester,
+            Col::Assignee => SortCol::Assignee,
+            Col::Deadline => SortCol::Deadline,
+            Col::Links => return None,
+        })
+    }
+
+    /// How soon the column is hidden when the queue gets narrow: the
+    /// highest goes first, and 0 is never hidden.
+    fn rank(self) -> u8 {
+        match self {
+            Col::Seq | Col::Title | Col::Status => 0,
+            Col::Department => 1,
+            Col::Priority => 2,
+            Col::Assignee => 3,
+            Col::Deadline => 4,
+            Col::Type => 5,
+            Col::Requester => 6,
+            Col::Links => 7,
+        }
+    }
+
+    /// The columns that fit in the given width, least important hidden first.
+    fn fitting(available: f32) -> Vec<Col> {
+        let mut columns = Col::ALL.to_vec();
+        let needed = |columns: &[Col]| {
+            columns.iter().map(|c| c.width()).sum::<f32>() + 9.0 * columns.len() as f32
+        };
+        while needed(&columns) > available {
+            let Some(drop) = columns
+                .iter()
+                .copied()
+                .filter(|c| c.rank() > 0)
+                .max_by_key(|c| c.rank())
+            else {
+                break;
+            };
+            columns.retain(|c| *c != drop);
+        }
+        columns
+    }
 }
 
 /// A question the user has to answer before something irreversible happens.
@@ -123,8 +256,9 @@ enum ConfirmWhat {
     CleanFiles,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 enum Tab {
+    #[default]
     Active,
     Queued,
     Running,
@@ -486,6 +620,10 @@ pub struct App {
     pending_kind: Pending,
     /// The request and change that was last reported as seen.
     last_marked: Option<(Uuid, u64)>,
+    icons: theme::Icons,
+    toasts: Vec<Toast>,
+    /// Set by the search shortcut: the search field takes focus next frame.
+    focus_search: bool,
     exporting: Option<Receiver<Option<Result<PathBuf, String>>>>,
     cleaning: Option<Receiver<CleanResult>>,
     search: String,
@@ -549,6 +687,7 @@ impl App {
             error: None,
             saved: false,
         };
+        let icons = theme::Icons::load(&ctx);
         let mut app = App {
             handle,
             config,
@@ -564,6 +703,9 @@ impl App {
             confirm: None,
             pending_kind: Pending::Other,
             last_marked: None,
+            icons,
+            toasts: Vec::new(),
+            focus_search: false,
             exporting: None,
             cleaning: None,
             search: String::new(),
@@ -586,6 +728,17 @@ impl App {
             downloads: Vec::new(),
         };
         app.board.drawing = car::load_drawing(&app.ctx);
+        app.board.icons = app.icons.clone();
+        // Pick up where the user left off.
+        if let Some(saved) = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<Remembered>(storage, REMEMBERED_KEY))
+        {
+            app.view = saved.view;
+            app.tab = saved.tab;
+            app.filters = saved.filters;
+            app.sort = saved.sort;
+        }
         apply_theme(&app.ctx, app.config.theme);
         // Look for a newer version once at start-up (not from the tests: it uses the network).
         if !cfg!(test) {
@@ -941,10 +1094,10 @@ impl App {
         let mut still_running = Vec::new();
         for download in std::mem::take(&mut self.downloads) {
             match download.rx.try_recv() {
-                Ok(Some(Ok(dest))) => self.notices.push_back(Notice {
-                    title: t("Filen är sparad", "The file is saved").to_string(),
-                    text: dest.display().to_string(),
-                }),
+                Ok(Some(Ok(dest))) => self.toast(
+                    t("Filen är sparad", "The file is saved"),
+                    dest.display().to_string(),
+                ),
                 Ok(Some(Err(text))) => self.notices.push_back(Notice {
                     title: t("Filen kunde inte hämtas", "The file could not be fetched")
                         .to_string(),
@@ -1025,10 +1178,10 @@ impl App {
                 Ok(result) => {
                     self.exporting = None;
                     match result {
-                        Some(Ok(dest)) => self.notices.push_back(Notice {
-                            title: t("Listan är sparad", "The list is saved").to_string(),
-                            text: dest.display().to_string(),
-                        }),
+                        Some(Ok(dest)) => self.toast(
+                            t("Listan är sparad", "The list is saved"),
+                            dest.display().to_string(),
+                        ),
                         Some(Err(text)) => self.notices.push_back(Notice {
                             title: t("Listan kunde inte sparas", "The list could not be saved")
                                 .to_string(),
@@ -1048,15 +1201,14 @@ impl App {
                     match result {
                         Ok((removed, sha256)) => {
                             self.handle.send(Cmd::FilesCleaned(sha256));
-                            self.notices.push_back(Notice {
-                                title: t("Filerna är rensade", "The files are cleaned up")
-                                    .to_string(),
-                                text: if is_en() {
+                            self.toast(
+                                t("Filerna är rensade", "The files are cleaned up"),
+                                if is_en() {
                                     format!("{removed} file(s) were removed.")
                                 } else {
                                     format!("{removed} fil(er) togs bort.")
                                 },
-                            });
+                            );
                         }
                         Err(text) => self.notices.push_back(Notice {
                             title: t(
@@ -1396,49 +1548,89 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(14, 8)),
             )
             .show(ctx, |ui| {
+                theme::finish_line(ui);
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     theme::logo(ui, logo.as_ref(), 26.0);
-                    ui.label(RichText::new("SimQ").size(20.0).strong());
+                    ui.label(
+                        RichText::new("SimQ")
+                            .font(theme::semibold_font(21.0))
+                            .color(ui.visuals().strong_text_color()),
+                    );
                     ui.add_space(10.0);
-                    for (view, label) in [
-                        (View::Queue, t("Kö", "Queue")),
-                        (View::Overview, t("Översikt", "Overview")),
-                        (View::Stats, t("Statistik", "Statistics")),
+                    for (view, label, key) in [
+                        (View::Queue, t("Kö", "Queue"), egui::Key::Num1),
+                        (View::Overview, t("Översikt", "Overview"), egui::Key::Num2),
+                        (View::Stats, t("Statistik", "Statistics"), egui::Key::Num3),
                     ] {
-                        ui.selectable_value(&mut self.view, view, RichText::new(label).strong());
+                        if theme::nav_tab(ui, self.view == view, label)
+                            .on_hover_text(shortcut_text(ui.ctx(), key))
+                            .clicked()
+                        {
+                            self.view = view;
+                        }
                     }
                     ui.add_space(10.0);
-                    if theme::add_primary(ui, can_write, t("+ Ny förfrågan", "+ New request"))
-                        .on_disabled_hover_text(self.why_read_only())
-                        .clicked()
+                    if theme::add_primary_icon(
+                        ui,
+                        can_write,
+                        &self.icons,
+                        theme::Icon::Plus,
+                        t("Ny förfrågan", "New request"),
+                    )
+                    .on_hover_text(shortcut_text(ui.ctx(), egui::Key::N))
+                    .on_disabled_hover_text(self.why_read_only())
+                    .clicked()
                     {
                         self.open_new_form(None, None);
                     }
                     if self.view == View::Queue {
                         ui.add_space(8.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .hint_text(t(
-                                    "Sök titel, beställare, typ, avdelning",
-                                    "Search title, requester, type, department",
-                                ))
-                                .desired_width(230.0),
-                        );
-                        if !self.search.is_empty() && ui.small_button(t("Rensa", "Clear")).clicked()
+                        self.icons.show(ui, theme::Icon::Search, 14.0);
+                        let search = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.search)
+                                    .hint_text(t(
+                                        "Sök titel, beställare, typ, avdelning",
+                                        "Search title, requester, type, department",
+                                    ))
+                                    .desired_width(220.0),
+                            )
+                            .on_hover_text(shortcut_text(ui.ctx(), egui::Key::F));
+                        if std::mem::take(&mut self.focus_search) {
+                            search.request_focus();
+                        }
+                        if !self.search.is_empty()
+                            && ui
+                                .add(self.icons.button(ui, theme::Icon::Close, "", "×").small())
+                                .on_hover_text(t("Rensa sökningen", "Clear the search"))
+                                .clicked()
                         {
                             self.search.clear();
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(t("Inställningar", "Settings")).clicked() {
+                        if ui
+                            .add(self.icons.button(
+                                ui,
+                                theme::Icon::Gear,
+                                t("Inställningar", "Settings"),
+                                "",
+                            ))
+                            .clicked()
+                        {
                             self.settings_open = true;
                             self.identity.saved = false;
                         }
                         // Shows what a click switches to.
                         let dark = ui.visuals().dark_mode;
+                        let (icon, fallback) = if dark {
+                            (theme::Icon::Sun, "☀")
+                        } else {
+                            (theme::Icon::Moon, "🌙")
+                        };
                         if ui
-                            .button(if dark { "☀" } else { "🌙" })
+                            .add(self.icons.button(ui, icon, "", fallback))
                             .on_hover_text(if dark {
                                 t("Byt till ljust läge", "Switch to light mode")
                             } else {
@@ -1452,12 +1644,21 @@ impl App {
                                 ThemeChoice::Dark
                             });
                         }
-                        if ui.button(t("Synka nu", "Sync now")).clicked() {
+                        if ui
+                            .add(self.icons.button(
+                                ui,
+                                theme::Icon::Sync,
+                                t("Synka nu", "Sync now"),
+                                "",
+                            ))
+                            .clicked()
+                        {
                             self.handle.send(Cmd::SyncNow);
                         }
                         self.update_button(ui);
                     });
                 });
+                ui.add_space(4.0);
                 if self.view != View::Queue {
                     return;
                 }
@@ -1616,7 +1817,14 @@ impl App {
                 if ui
                     .add_enabled(
                         self.exporting.is_none(),
-                        egui::Button::new(t("Exportera CSV", "Export CSV")).small(),
+                        self.icons
+                            .button(
+                                ui,
+                                theme::Icon::Export,
+                                t("Exportera CSV", "Export CSV"),
+                                "",
+                            )
+                            .small(),
                     )
                     .on_hover_text(t(
                         "Sparar listan som den visas nu, till exempel för Excel",
@@ -1721,25 +1929,57 @@ impl App {
         let mut rows = self.filtered(&snapshot, Some(self.tab));
         self.sort_rows(&mut rows, &snapshot);
         let sort = self.sort;
+        let can_write = self.can_write();
+        let icons = self.icons.clone();
         let mut clicked_header = None;
+        let (mut new_request, mut clear_filters, mut show_all) = (false, false, false);
         let today = Local::now().date_naive();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if rows.is_empty() {
-                ui.add_space(40.0);
+                ui.add_space((ui.available_height() * 0.22).max(24.0));
                 ui.vertical_centered(|ui| {
                     if snapshot.requests.is_empty() {
-                        ui.weak(t(
-                            "Inga förfrågningar än. Klicka på \"+ Ny förfrågan\" för att lägga upp den första.",
-                            "No requests yet. Click \"+ New request\" to add the first one.",
-                        ));
+                        empty_state(
+                            ui,
+                            t("Kön är tom", "The queue is empty"),
+                            t(
+                                "Lägg upp lagets första simuleringsförfrågan.",
+                                "Add the team's first simulation request.",
+                            ),
+                        );
+                        new_request = theme::add_primary_icon(
+                            ui,
+                            can_write,
+                            &icons,
+                            theme::Icon::Plus,
+                            t("Ny förfrågan", "New request"),
+                        )
+                        .clicked();
                     } else if filtering {
-                        ui.weak(t(
-                            "Inga ärenden matchar sökningen och filtren.",
-                            "No requests match the search and the filters.",
-                        ));
+                        empty_state(
+                            ui,
+                            t("Inga träffar", "No matches"),
+                            t(
+                                "Inga ärenden matchar sökningen och filtren.",
+                                "No requests match the search and the filters.",
+                            ),
+                        );
+                        clear_filters = ui
+                            .button(t("Rensa sökning och filter", "Clear search and filters"))
+                            .clicked();
                     } else {
-                        ui.weak(t("Inga ärenden under den här fliken.", "No requests under this tab."));
+                        empty_state(
+                            ui,
+                            t("Inget här just nu", "Nothing here right now"),
+                            t(
+                                "Inga ärenden under den här fliken.",
+                                "No requests under this tab.",
+                            ),
+                        );
+                        show_all = ui
+                            .button(t("Visa alla ärenden", "Show all requests"))
+                            .clicked();
                     }
                 });
                 return;
@@ -1748,50 +1988,30 @@ impl App {
             ui.style_mut().interaction.selectable_labels = false;
             let overdue_color = ui.visuals().error_fg_color;
             let dark = ui.visuals().dark_mode;
-            TableBuilder::new(ui)
+            // Only the columns that fit: with the request open beside the
+            // queue the least important ones are hidden instead of cut off.
+            let columns = Col::fitting(ui.available_width());
+            let mut table = TableBuilder::new(ui)
+                .id_salt(("queue", columns.len()))
                 .striped(true)
                 .resizable(true)
                 .sense(egui::Sense::click())
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::initial(40.0).at_least(30.0).clip(true))
-                .column(Column::remainder().at_least(150.0).clip(true))
-                .column(Column::initial(115.0).at_least(50.0).clip(true))
-                .column(Column::initial(115.0).at_least(50.0).clip(true))
-                .column(Column::initial(70.0).at_least(50.0).clip(true))
-                .column(Column::initial(105.0).at_least(70.0).clip(true))
-                .column(Column::initial(105.0).at_least(60.0).clip(true))
-                .column(Column::initial(105.0).at_least(60.0).clip(true))
-                .column(Column::initial(90.0).at_least(70.0).clip(true))
-                .column(Column::initial(120.0).at_least(60.0).clip(true))
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for col in &columns {
+                table = table.column(if *col == Col::Title {
+                    Column::remainder().at_least(150.0).clip(true)
+                } else {
+                    Column::initial(col.width()).at_least(30.0).clip(true)
+                });
+            }
+            table
                 .header(26.0, |mut header| {
-                    for (title, col) in [
-                        ("#", Some(SortCol::Seq)),
-                        (t("Titel", "Title"), Some(SortCol::Title)),
-                        (t("Avdelning", "Department"), Some(SortCol::Department)),
-                        (t("Typ", "Type"), Some(SortCol::Type)),
-                        (t("Prioritet", "Priority"), Some(SortCol::Priority)),
-                        ("Status", Some(SortCol::Status)),
-                        (t("Beställare", "Requester"), Some(SortCol::Requester)),
-                        (t("Utförare", "Assignee"), Some(SortCol::Assignee)),
-                        ("Deadline", Some(SortCol::Deadline)),
-                        (t("Rapport / resultat", "Report / results"), None),
-                    ] {
+                    for col in &columns {
                         header.col(|ui| {
-                            let arrow = match (sort, col) {
-                                (Some((by, ascending)), Some(col)) if by == col => {
-                                    if ascending {
-                                        " ⏶"
-                                    } else {
-                                        " ⏷"
-                                    }
-                                }
-                                _ => "",
-                            };
-                            let text = RichText::new(format!("{title}{arrow}"))
-                                .size(12.0)
-                                .strong()
+                            let text = RichText::new(col.title().to_uppercase())
+                                .font(theme::semibold_font(11.5))
                                 .color(ui.visuals().weak_text_color());
-                            let Some(col) = col else {
+                            let Some(by) = col.sort() else {
                                 ui.label(text);
                                 return;
                             };
@@ -1799,7 +2019,28 @@ impl App {
                                 .add(egui::Label::new(text).sense(egui::Sense::click()))
                                 .on_hover_text(t("Klicka för att sortera", "Click to sort"));
                             if response.clicked() {
-                                clicked_header = Some(col);
+                                clicked_header = Some(by);
+                            }
+                            if let Some((_, ascending)) = sort.filter(|(sorted, _)| *sorted == by) {
+                                // A small arrow: up for ascending.
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                let (tip, base) = if ascending {
+                                    (rect.top() + 1.0, rect.bottom() - 1.0)
+                                } else {
+                                    (rect.bottom() - 1.0, rect.top() + 1.0)
+                                };
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    vec![
+                                        egui::pos2(rect.center().x, tip),
+                                        egui::pos2(rect.right(), base),
+                                        egui::pos2(rect.left(), base),
+                                    ],
+                                    theme::ACCENT,
+                                    egui::Stroke::NONE,
+                                ));
                             }
                         });
                     }
@@ -1808,61 +2049,79 @@ impl App {
                     body.rows(32.0, rows.len(), |mut row| {
                         let request = rows[row.index()];
                         row.set_selected(selected == Some(request.request_id));
-                        row.col(|ui| {
-                            ui.weak(request.seq.to_string());
-                        });
-                        row.col(|ui| {
-                            if snapshot.unread.contains(&request.request_id) {
-                                theme::dot(ui, theme::ACCENT);
-                            }
-                            cell(ui, &request.title);
-                            if !request.comments.is_empty() {
-                                ui.weak(format!("({})", request.comments.len())).on_hover_text(
-                                    t("Antal kommentarer", "Number of comments"),
-                                );
-                            }
-                        });
-                        row.col(|ui| {
-                            if let Some(d) = find_department(&snapshot, request.department) {
-                                theme::dot(ui, theme::dept_color(d.color, dark));
-                                cell(ui, &d.name);
-                            }
-                        });
-                        row.col(|ui| {
-                            cell(ui, &request.sim_type);
-                        });
-                        row.col(|ui| {
-                            let text = RichText::new(priority_label(request.priority))
-                                .color(theme::priority_color(request.priority, ui));
-                            ui.label(if request.priority == 1 {
-                                text.strong()
-                            } else {
-                                text
+                        for col in &columns {
+                            row.col(|ui| match col {
+                                Col::Seq => {
+                                    ui.label(
+                                        RichText::new(request.seq.to_string())
+                                            .font(theme::semibold_font(13.0))
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                }
+                                Col::Title => {
+                                    if snapshot.unread.contains(&request.request_id) {
+                                        theme::dot(ui, theme::ACCENT);
+                                    }
+                                    cell(ui, &request.title);
+                                    if !request.comments.is_empty() {
+                                        ui.spacing_mut().item_spacing.x = 3.0;
+                                        icons.show(ui, theme::Icon::Comment, 12.0);
+                                        ui.weak(request.comments.len().to_string()).on_hover_text(
+                                            t("Antal kommentarer", "Number of comments"),
+                                        );
+                                    }
+                                }
+                                Col::Department => {
+                                    if let Some(d) = find_department(&snapshot, request.department)
+                                    {
+                                        theme::dot(ui, theme::dept_color(d.color, dark));
+                                        cell(ui, &d.name);
+                                    }
+                                }
+                                Col::Type => cell(ui, &request.sim_type),
+                                Col::Priority => {
+                                    let text = RichText::new(priority_label(request.priority))
+                                        .color(theme::priority_color(request.priority, ui));
+                                    ui.label(if request.priority == 1 {
+                                        text.strong()
+                                    } else {
+                                        text
+                                    });
+                                }
+                                Col::Status => {
+                                    theme::status_pill(ui, request.status);
+                                }
+                                Col::Requester => cell(ui, &request.requester),
+                                Col::Assignee => cell(ui, &request.assignee),
+                                Col::Deadline => {
+                                    if is_overdue(request, today) {
+                                        ui.colored_label(overdue_color, &request.deadline)
+                                            .on_hover_text(t(
+                                                "Deadline har passerat",
+                                                "The deadline has passed",
+                                            ));
+                                    } else {
+                                        ui.label(&request.deadline);
+                                    }
+                                }
+                                Col::Links => {
+                                    if request.status == Status::Done {
+                                        quick_link(
+                                            ui,
+                                            t("Rapport", "Report"),
+                                            request.report.as_ref(),
+                                            actions,
+                                        );
+                                        quick_link(
+                                            ui,
+                                            t("Resultat", "Results"),
+                                            request.results.as_ref(),
+                                            actions,
+                                        );
+                                    }
+                                }
                             });
-                        });
-                        row.col(|ui| {
-                            theme::status_pill(ui, request.status);
-                        });
-                        row.col(|ui| {
-                            cell(ui, &request.requester);
-                        });
-                        row.col(|ui| {
-                            cell(ui, &request.assignee);
-                        });
-                        row.col(|ui| {
-                            if is_overdue(request, today) {
-                                ui.colored_label(overdue_color, &request.deadline)
-                                    .on_hover_text(t("Deadline har passerat", "The deadline has passed"));
-                            } else {
-                                ui.label(&request.deadline);
-                            }
-                        });
-                        row.col(|ui| {
-                            if request.status == Status::Done {
-                                quick_link(ui, t("Rapport", "Report"), request.report.as_ref(), actions);
-                                quick_link(ui, t("Resultat", "Results"), request.results.as_ref(), actions);
-                            }
-                        });
+                        }
                         if row.response().clicked() {
                             actions.push(UiAction::Select(request.request_id));
                         }
@@ -1876,6 +2135,16 @@ impl App {
                 Some((by, false)) if by == col => None,
                 _ => Some((col, true)),
             };
+        }
+        if new_request {
+            self.open_new_form(None, None);
+        }
+        if clear_filters {
+            self.filters = Filters::default();
+            self.search.clear();
+        }
+        if show_all {
+            self.tab = Tab::All;
         }
     }
 
@@ -1901,6 +2170,7 @@ impl App {
             self.handle.send(Cmd::MarkSeen(id));
         }
         let dark = ctx.style().visuals.dark_mode;
+        let icons = self.icons.clone();
 
         egui::SidePanel::right("detail")
             .resizable(true)
@@ -1921,7 +2191,11 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button(t("Stäng", "Close")).clicked() {
+                                    if ui
+                                        .add(icons.button(ui, theme::Icon::Close, "", "×"))
+                                        .on_hover_text(t("Stäng (Esc)", "Close (Esc)"))
+                                        .clicked()
+                                    {
                                         actions.push(UiAction::CloseDetail);
                                     }
                                 },
@@ -2281,13 +2555,124 @@ impl App {
                 }
             });
         if !open {
-            self.settings_open = false;
-            // Unsaved changes are discarded.
-            self.identity.name = self.config.display_name.clone();
-            self.identity.folder = self.config.sync_folder.clone();
-            self.identity.github = self.config.github.is_some();
-            self.identity.team_key.clear();
-            self.identity.error = None;
+            self.close_settings();
+        }
+    }
+
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        // Unsaved changes are discarded.
+        self.identity.name = self.config.display_name.clone();
+        self.identity.folder = self.config.sync_folder.clone();
+        self.identity.github = self.config.github.is_some();
+        self.identity.team_key.clear();
+        self.identity.error = None;
+    }
+
+    /// Shows a message in the corner for a few seconds.
+    fn toast(&mut self, title: &str, text: String) {
+        self.toasts.push(Toast {
+            title: title.to_string(),
+            text,
+            shown: std::time::Instant::now(),
+        });
+    }
+
+    fn toast_ui(&mut self, ctx: &egui::Context) {
+        self.toasts
+            .retain(|toast| toast.shown.elapsed().as_secs_f32() < TOAST_SECONDS);
+        if self.toasts.is_empty() {
+            return;
+        }
+        let mut dismissed = None;
+        egui::Area::new(egui::Id::new("toasts"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -44.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                for (index, toast) in self.toasts.iter().enumerate() {
+                    let response = egui::Frame::new()
+                        .fill(ui.visuals().window_fill)
+                        .stroke(ui.visuals().window_stroke)
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(14, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(320.0);
+                            ui.label(
+                                RichText::new(one_line(&toast.title))
+                                    .font(theme::semibold_font(14.0))
+                                    .color(ui.visuals().strong_text_color()),
+                            );
+                            if !toast.text.trim().is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(one_line(&toast.text))
+                                            .size(12.5)
+                                            .color(ui.visuals().weak_text_color()),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        })
+                        .response;
+                    // A red edge, and a click puts the message away.
+                    let edge = egui::Rect::from_min_max(
+                        response.rect.left_top(),
+                        egui::pos2(response.rect.left() + 3.0, response.rect.bottom()),
+                    );
+                    ui.painter()
+                        .rect_filled(edge, egui::CornerRadius::ZERO, theme::ACCENT);
+                    if response.interact(egui::Sense::click()).clicked() {
+                        dismissed = Some(index);
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+        if let Some(index) = dismissed {
+            self.toasts.remove(index);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    /// Keyboard shortcuts: new request, search, the three views and Esc.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let command = egui::Modifiers::COMMAND;
+        let pressed = |key| ctx.input_mut(|i| i.consume_key(command, key));
+        if pressed(egui::Key::N) && self.can_write() && self.form.is_none() {
+            self.open_new_form(None, None);
+        }
+        if pressed(egui::Key::F) {
+            self.view = View::Queue;
+            self.focus_search = true;
+        }
+        for (key, view) in [
+            (egui::Key::Num1, View::Queue),
+            (egui::Key::Num2, View::Overview),
+            (egui::Key::Num3, View::Stats),
+        ] {
+            if pressed(key) {
+                self.view = view;
+            }
+        }
+        // Esc first leaves a text field (egui does that), then closes the
+        // topmost thing that is open.
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if !typing && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if !self.notices.is_empty() {
+                self.notices.pop_front();
+            } else if self.confirm.is_some() {
+                self.confirm = None;
+            } else if self.form.is_some() {
+                if self.pending.is_none() {
+                    self.form = None;
+                    self.form_error = None;
+                }
+            } else if self.settings_open {
+                self.close_settings();
+            } else if self.view == View::Overview {
+                self.board.escape();
+            } else if self.view == View::Queue {
+                self.selected = None;
+            }
         }
     }
 
@@ -2673,6 +3058,15 @@ impl eframe::App for App {
             self.notice_ui(ctx);
             return;
         }
+        self.shortcuts(ctx);
+        // A remembered filter on a department that is gone would hide everything.
+        if let Some(Some(id)) = self.filters.department {
+            if self.snapshot.status == FolderStatus::Ok
+                && find_department(&self.snapshot, Some(id)).is_none()
+            {
+                self.filters.department = None;
+            }
+        }
         let mut actions = Vec::new();
         self.top_ui(ctx);
         self.status_ui(ctx);
@@ -2688,13 +3082,45 @@ impl eframe::App for App {
         self.settings_ui(ctx);
         self.confirm_ui(ctx);
         self.notice_ui(ctx);
+        self.toast_ui(ctx);
         self.apply(ctx, actions);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let remembered = Remembered {
+            view: self.view,
+            tab: self.tab,
+            filters: self.filters.clone(),
+            sort: self.sort,
+        };
+        eframe::set_value(storage, REMEMBERED_KEY, &remembered);
+    }
+
+    fn auto_save_interval(&self) -> std::time::Duration {
+        // The window and the view are also saved when the app closes.
+        std::time::Duration::from_secs(120)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Free-standing helper functions
 // ---------------------------------------------------------------------------
+
+/// The heading and explanation of an empty view. Buttons go below it.
+fn empty_state(ui: &mut egui::Ui, title: &str, text: &str) {
+    ui.label(
+        RichText::new(title)
+            .font(theme::semibold_font(19.0))
+            .color(ui.visuals().strong_text_color()),
+    );
+    ui.weak(text);
+    ui.add_space(10.0);
+}
+
+/// "⌘N" on a Mac, "Ctrl+N" elsewhere.
+fn shortcut_text(ctx: &egui::Context, key: egui::Key) -> String {
+    ctx.format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key))
+}
 
 fn apply_theme(ctx: &egui::Context, theme: ThemeChoice) {
     ctx.set_theme(match theme {
@@ -3181,6 +3607,27 @@ fn new_form_ui(ui: &mut egui::Ui, f: &mut NewForm, snapshot: &Snapshot) {
                 .char_limit(10)
                 .desired_width(140.0),
         );
+        // A calendar to pick the date from. Typing it still works.
+        let today = Local::now().date_naive();
+        let mut date = NaiveDate::parse_from_str(f.deadline.trim(), "%Y-%m-%d").unwrap_or(today);
+        let before = date;
+        ui.add(
+            egui_extras::DatePickerButton::new(&mut date)
+                .id_salt("deadline_picker")
+                .show_icon(true)
+                .format(if f.deadline.trim().is_empty() {
+                    " "
+                } else {
+                    "%Y-%m-%d"
+                }),
+        )
+        .on_hover_text(t("Välj datum i kalendern", "Pick the date in the calendar"));
+        if date != before {
+            f.deadline = date.format("%Y-%m-%d").to_string();
+        }
+        if !f.deadline.is_empty() && ui.small_button(t("Rensa", "Clear")).clicked() {
+            f.deadline.clear();
+        }
     });
     ui.add_space(6.0);
 

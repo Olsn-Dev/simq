@@ -23,7 +23,7 @@
 - **Works offline.** Changes are sent when the network is back.
 - **No clashes.** If two people take the same request at the same time, everyone ends up with the same winner.
 - **Swedish and English.** Each person chooses their own language.
-- **A single file** for Windows, macOS and Linux. Nothing to install.
+- **Small and self-contained** for Windows, macOS and Linux: an installer on Windows, a disk image on macOS.
 
 **Contents:** [How it works](#how-it-works) · [The overview](#the-overview) · [Get started with GitHub](#get-started-with-github) · [Shared folder](#get-started-with-a-shared-folder-alternative) · [Download](#download-and-start) · [Updating](#updating) · [Good to know](#good-to-know) · [For developers](#for-developers)
 
@@ -58,6 +58,9 @@ For every file (input, report, results) you choose how to point to it. You can u
 - **New for you.** A blue dot marks your own requests (the ones you created or took) that someone else has changed or commented on since you last opened them. The "New for you" filter shows only those.
 - **Duplicate.** A request cannot be edited, but **Duplicate…** opens a new one filled in from it.
 - **Export CSV.** Saves the list as it is shown, for Excel or a meeting. The file uses semicolons between the columns.
+- **Room for the request.** When a request is open beside the queue, the least important columns are hidden instead of cut off. They come back when you close it.
+- **Shortcuts.** Ctrl+N (⌘N on a Mac) starts a new request, Ctrl+F goes to the search field, Ctrl+1, 2 and 3 switch between Queue, Overview and Statistics, and Esc closes what is open.
+- **It remembers.** The window size and position, the column widths, the page you were on, the tab and the filters are kept between starts.
 
 ## The overview
 
@@ -69,7 +72,7 @@ The **Overview** page shows a drawing of a formula car, from the side and from a
 2. **Place it on the car.** Click the parts of the car that belong to the department: front wing, nose, front suspension, front wheels, monocoque and cockpit, sidepods, floor, engine cover, rear suspension, rear wheels and rear wing. Each part follows the shape of the car and is the same part in both views. A department can have several parts, and a part belongs to one department at a time. Click a part again to remove it, then **Save**. A new department goes straight to this step.
 3. **Add its parts.** Each part in the list has a status: Not started, Design, Simulation, Manufacturing or Done. Change it as the work moves on. A part can also have a short note.
 
-The colour of a department's shapes shows how far its parts have come, from red over amber to green. Grey means the department has no parts yet. Point at a shape to light up everything that belongs to the same department, in both views. Click it to open the department. From there you can also create a simulation request for the department or for one part, and see its open requests. A click between the shapes does nothing.
+The colour of a department's shapes shows how far its parts have come, from red over amber to green. A red badge with a number shows how many simulation requests the department has open. Grey means the department has no parts yet. Point at a shape to light up everything that belongs to the same department, in both views. Click it to open the department. From there you can also create a simulation request for the department or for one part, and see its open requests. A click between the shapes does nothing.
 
 Team members on a version older than 0.5.1 do not see departments that are placed on the car until they update. Zones drawn as rectangles in version 0.5.0 are no longer shown: place those departments again.
 
@@ -110,11 +113,11 @@ Tip: if you put a text file called `simq-teamkey.txt` containing the team key in
 
 Get the latest version for your system under **Releases** on the GitHub page:
 
-- **Windows:** unpack the zip file and double-click `SimQ.exe`.
+- **Windows:** run the `-setup.exe` installer. It installs SimQ for your user only, without administrator rights, and adds a Start menu shortcut and an uninstaller. There is also a zip file with just `SimQ.exe` if you prefer not to install.
 - **macOS:** open the `.dmg` file and drag `SimQ` to Applications.
 - **Linux:** unpack the `tar.gz` file and run `./simq`.
 
-The app is a single self-contained file. Nothing needs to be installed.
+The app is a single self-contained program. Nothing else needs to be installed.
 
 The first time, you choose language (**Svenska** or **English**), display name and how the app should sync. Each person chooses their own language, and the team can mix freely. Everything can be changed later under **Settings**.
 
@@ -222,6 +225,10 @@ git tag v0.1.0 && git push origin v0.1.0
 
 The car on the overview page is `assets/car.png`: white line art on a transparent background, tinted by the app for light and dark mode. The clickable parts are outlines traced over it in `src/ui/car.rs`, in the picture's own pixel coordinates.
 
+The Windows installer is built from `installer/simq.iss` with Inno Setup by the release workflow.
+
+The look is set in `src/theme.rs`: racing red on carbon grey, slanted primary buttons and the [Titillium Web](https://fonts.google.com/specimen/Titillium+Web) typeface (SIL Open Font License, see `assets/fonts/OFL.txt`). The button icons are drawn by `tools/make_icons.py`.
+
 The app icon is drawn by a script. To change it, edit `tools/make_icon.py` and run it (requires Pillow):
 
 ```bash
@@ -239,3 +246,7 @@ Keep the app's source code in a different repository from the team's data, and n
 - Everything coming from outside is treated as untrusted input: files over 64 KiB, broken JSON, unknown fields and files with the wrong name or path are ignored. Only `http://` and `https://` links can be clicked.
 
 The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `blobs` (uploaded files), `export` (CSV and statistics), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui` (with `ui/overview` and `ui/car` for the car and `ui/stats`).
+
+## Licence
+
+SimQ is released under the [MIT licence](LICENSE). The Titillium Web typeface in `assets/fonts` has its own licence, the SIL Open Font License (`assets/fonts/OFL.txt`).

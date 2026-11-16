@@ -61,6 +61,9 @@ fn main() -> anyhow::Result<()> {
             .with_icon(
                 eframe::icon_data::from_png_bytes(simq::theme::ICON_PNG).unwrap_or_default(),
             ),
+        // Window size and position, column widths and the open view are
+        // remembered here between starts.
+        persistence_path: paths.config_file.parent().map(|dir| dir.join("window.ron")),
         ..Default::default()
     };
     eframe::run_native(

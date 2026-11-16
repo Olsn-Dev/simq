@@ -57,6 +57,21 @@ jobs:
           Copy-Item README.md dist/SimQ/
           Compress-Archive -Path dist/SimQ -DestinationPath "simq-${{ github.ref_name }}-${{ matrix.name }}.zip"
 
+      # An installer with a Start menu shortcut and an uninstaller. If it
+      # cannot be built the release still gets the zip file.
+      - name: Installer (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          & $iscc "/DAppVersion=$version" installer\simq.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -107,10 +122,13 @@ jobs:
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          # Lists the changes since the previous version on the release page.
+          generate_release_notes: true
           files: |
             simq-*.zip
             simq-*.tar.gz
             simq-*.dmg
+            simq-*-setup.exe
             simq-windows-x64.exe
             simq-macos-arm64
             simq-linux-x64

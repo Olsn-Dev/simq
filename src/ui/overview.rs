@@ -37,6 +37,19 @@ pub(super) struct BoardUi {
     car: Car,
     /// The line art of the car, loaded when the app starts.
     pub(super) drawing: Option<egui::TextureHandle>,
+    pub(super) icons: theme::Icons,
+}
+
+impl BoardUi {
+    /// Esc: leaves the choosing of regions, else goes back to all departments.
+    pub(super) fn escape(&mut self) {
+        if self.text_edit.take().is_some() {
+            return;
+        }
+        if self.place.take().is_none() {
+            self.selected = None;
+        }
+    }
 }
 
 /// A name or note being edited in place.
@@ -590,7 +603,12 @@ fn dept_ui(
     let dark = ui.visuals().dark_mode;
     ui.add_space(2.0);
     if ui
-        .button(t("⏴ Alla avdelningar", "⏴ All departments"))
+        .add(board.icons.button(
+            ui,
+            theme::Icon::Back,
+            t("Alla avdelningar", "All departments"),
+            "",
+        ))
         .clicked()
     {
         out.push(BoardAction::Select(None));
@@ -707,7 +725,16 @@ fn dept_ui(
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_enabled_ui(can_write, |ui| {
-                    ui.menu_button("…", |ui| {
+                    let more = board
+                        .icons
+                        .image(
+                            theme::Icon::More,
+                            14.0,
+                            ui.visuals().widgets.inactive.fg_stroke.color,
+                        )
+                        .map(egui::Button::image)
+                        .unwrap_or_else(|| egui::Button::new("…"));
+                    egui::menu::menu_custom_button(ui, more, |ui| {
                         if ui.button(t("Byt namn", "Rename")).clicked() {
                             out.push(BoardAction::EditText(
                                 part.id,
@@ -1163,6 +1190,51 @@ fn canvas_ui(
         }
     }
 
+    // A red badge with the number of open simulation requests of each
+    // department, once per view.
+    for dept in &snapshot.departments {
+        let open = snapshot
+            .requests
+            .iter()
+            .filter(|r| r.department == Some(dept.id) && r.status.is_active())
+            .count();
+        if open == 0 {
+            continue;
+        }
+        // Above the name tag when the department is selected.
+        let lift = if board.selected == Some(dept.id) {
+            21.0
+        } else {
+            0.0
+        };
+        for side_view in [true, false] {
+            let largest = regions_of(&board.car, dept)
+                .filter(|r| owner(snapshot, r.id).is_some_and(|d| d.id == dept.id))
+                .filter_map(|r| r.largest(side_view))
+                .max_by(|a, b| a.area.total_cmp(&b.area));
+            if let Some(outline) = largest {
+                let at = map.pt(outline.center.0, outline.center.1) - egui::vec2(0.0, lift);
+                painter.circle(
+                    at,
+                    9.5,
+                    theme::ACCENT,
+                    Stroke::new(1.5_f32, visuals.panel_fill),
+                );
+                painter.text(
+                    at,
+                    egui::Align2::CENTER_CENTER,
+                    if open > 9 {
+                        "9+".to_string()
+                    } else {
+                        open.to_string()
+                    },
+                    theme::semibold_font(11.5),
+                    Color32::WHITE,
+                );
+            }
+        }
+    }
+
     if let Some(region) = hit {
         let response = match hovered_dept {
             Some(_) => response
@@ -1175,6 +1247,21 @@ fn canvas_ui(
                 let (progress, _, total) = dept_progress(snapshot, dept.id);
                 ui.label(RichText::new(one_line(&dept.name)).strong());
                 ui.weak(region.label());
+                let open = snapshot
+                    .requests
+                    .iter()
+                    .filter(|r| r.department == Some(dept.id) && r.status.is_active())
+                    .count();
+                if open > 0 {
+                    ui.colored_label(
+                        theme::ACCENT,
+                        if is_en() {
+                            format!("{open} open simulation request(s)")
+                        } else {
+                            format!("{open} öppna simuleringsförfrågningar")
+                        },
+                    );
+                }
                 if total == 0 {
                     ui.weak(t("Inga delar än", "No parts yet"));
                 } else {
@@ -1372,6 +1459,7 @@ mod tests {
         let dir = TempDir::new();
         let (snapshot, aero, chassis) = snapshot(&dir);
         let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
         let mut board = BoardUi {
             selected: Some(chassis),
             place: Some(Place {
