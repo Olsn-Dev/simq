@@ -34,9 +34,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     let paths = config::resolve_paths(args.config_dir.as_deref())?;
-    let cfg = config::load_or_init(&paths)
+    let mut cfg = config::load_or_init(&paths)
         .context("kunde inte läsa inställningarna / could not read the settings")?;
     i18n::set(cfg.language);
+    let current = env!("CARGO_PKG_VERSION");
+    let news = config::take_last_seen_version(&mut cfg, current)
+        .and_then(|last| simq::news::text(&last, current));
+    // A failure here only means the news may be shown once more.
+    let _ = config::save(&paths, &cfg);
     simq::update::clean_up_after_update();
     let store = Store::open_or_recreate(&paths.cache_file).context(t(
         "kunde inte öppna den lokala cachen",
@@ -69,7 +74,18 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "simq",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, client, cfg, paths)?))),
+        Box::new(move |cc| {
+            let mut app = App::new(cc, client, cfg, paths)?;
+            if let Some(text) = news {
+                let title = if i18n::is_en() {
+                    format!("New in version {current}")
+                } else {
+                    format!("Nytt i version {current}")
+                };
+                app.show_notice(title, text);
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| {
         anyhow!(

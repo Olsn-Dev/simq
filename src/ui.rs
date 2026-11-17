@@ -3040,6 +3040,11 @@ impl App {
         }
     }
 
+    /// Shows a message in a window that stays until the user closes it.
+    pub fn show_notice(&mut self, title: String, text: String) {
+        self.notices.push_back(Notice { title, text });
+    }
+
     fn notice_ui(&mut self, ctx: &egui::Context) {
         let Some(notice) = self.notices.front() else {
             return;
@@ -3986,6 +3991,7 @@ mod tests {
         applied(bo.submit(Some(request), &take_action("Bo")));
 
         let config = Config {
+            last_seen_version: None,
             sync_folder: Some(shared.path().to_path_buf()),
             github: None,
             display_name: "Anna".to_string(),

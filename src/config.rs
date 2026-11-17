@@ -47,6 +47,10 @@ pub struct Config {
     #[serde(default)]
     pub theme: ThemeChoice,
     pub client_id: Uuid,
+    /// The app version that last started with these settings. Missing in
+    /// settings from before 0.6.0.
+    #[serde(default)]
+    pub last_seen_version: Option<String>,
 }
 
 impl Config {
@@ -58,6 +62,7 @@ impl Config {
             language: Lang::default(),
             theme: ThemeChoice::default(),
             client_id: Uuid::new_v4(),
+            last_seen_version: None,
         }
     }
 
@@ -145,6 +150,20 @@ pub fn resolve_paths(override_dir: Option<&Path>) -> Result<Paths, ConfigError> 
         legacy_config_file: directories::ProjectDirs::from("se", "SimKo", "SimKo")
             .map(|old| old.config_dir().join("config.json")),
     })
+}
+
+/// The version whose news the user should see now, and notes that this
+/// version has started. Returns the version last seen, or `None` on a first
+/// run (nothing to tell then). Settings from before 0.6.0 lack the field and
+/// count as 0.5.2.
+pub fn take_last_seen_version(config: &mut Config, current: &str) -> Option<String> {
+    let last = match config.last_seen_version.take() {
+        Some(last) => Some(last),
+        None if config.is_complete() => Some("0.5.2".to_string()),
+        None => None,
+    };
+    config.last_seen_version = Some(current.to_string());
+    last
 }
 
 /// Reads the configuration. If it is missing (first run) or cannot be
@@ -282,6 +301,30 @@ mod tests {
             ThemeChoice::System
         );
         assert_eq!(loaded.client_id, config.client_id);
+    }
+
+    #[test]
+    fn the_last_seen_version_is_noted() {
+        let tmp = TempDir::new();
+        let paths = resolve_paths(Some(tmp.path())).unwrap();
+        // First run: nothing to tell, but the version is noted.
+        let mut config = load_or_init(&paths).unwrap();
+        assert_eq!(take_last_seen_version(&mut config, "0.6.0"), None);
+        assert_eq!(config.last_seen_version.as_deref(), Some("0.6.0"));
+        // Settings from before the field existed count as 0.5.2.
+        config.last_seen_version = None;
+        config.display_name = "Åsa".to_string();
+        config.sync_folder = Some(tmp.path().to_path_buf());
+        assert_eq!(
+            take_last_seen_version(&mut config, "0.6.0").as_deref(),
+            Some("0.5.2")
+        );
+        save(&paths, &config).unwrap();
+        let mut again = load_or_init(&paths).unwrap();
+        assert_eq!(
+            take_last_seen_version(&mut again, "0.6.1").as_deref(),
+            Some("0.6.0")
+        );
     }
 
     #[test]

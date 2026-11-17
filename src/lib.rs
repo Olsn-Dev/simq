@@ -9,6 +9,7 @@
 //! - `sync`   – folder reading, submitting own events and the background thread
 //! - `config` – local configuration and identity
 //! - `export` – CSV export and statistics
+//! - `news`   – "new in this version", shown once after an update
 //! - `ui`     – the egui user interface
 
 pub mod blobs;
@@ -18,6 +19,7 @@ pub mod github;
 pub mod hlc;
 pub mod i18n;
 pub mod model;
+pub mod news;
 pub mod ops;
 pub mod replay;
 pub mod store;
