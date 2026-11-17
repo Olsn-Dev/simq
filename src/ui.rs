@@ -24,8 +24,8 @@ use crate::github::{GithubRemote, RemoteState, RemoteStatus, RemoteStore};
 use crate::i18n::{self, is_en, t, Lang};
 use crate::model::{
     char_len, clean_text, is_http_url, list_order, one_line, priority_label, truncate_chars,
-    valid_deadline, Department, LocKind, Location, Part, Request, Status, MAX_NAME, MAX_TEXT,
-    MAX_TITLE,
+    valid_deadline, Department, LocKind, Location, Part, Request, Status, MAX_ATTACHMENTS,
+    MAX_NAME, MAX_TEXT, MAX_TITLE,
 };
 use crate::ops::NewAction;
 use crate::store::SeenState;
@@ -448,6 +448,12 @@ struct FinishForm {
     summary: String,
 }
 
+struct AttachForm {
+    request_id: Uuid,
+    title: String,
+    location: LocInput,
+}
+
 struct NoteForm {
     request_id: Uuid,
     title: String,
@@ -467,6 +473,7 @@ enum Form {
     New(NewForm),
     Finish(FinishForm),
     Note(NoteForm),
+    Attach(AttachForm),
 }
 
 impl Form {
@@ -487,6 +494,11 @@ impl Form {
                 },
                 truncate_chars(&one_line(&f.title), 40)
             ),
+            Form::Attach(f) => format!(
+                "{}: {}",
+                t("Lägg till fil", "Add file"),
+                truncate_chars(&one_line(&f.title), 40)
+            ),
         }
     }
 
@@ -499,6 +511,7 @@ impl Form {
                 NoteKind::Cancel => t("Avbryt ärendet", "Cancel the request"),
                 NoteKind::Delete => t("Ta bort ärendet", "Delete the request"),
             },
+            Form::Attach(_) => t("Lägg till", "Add"),
         }
     }
 
@@ -540,6 +553,7 @@ impl Form {
                 }
             }
             Form::Note(_) => None,
+            Form::Attach(f) => f.location.problem(t("Fil", "File"), true),
         }
     }
 
@@ -589,6 +603,17 @@ impl Form {
                 };
                 (Some(f.request_id), action, Vec::new())
             }
+            Form::Attach(f) => (
+                Some(f.request_id),
+                NewAction::Attach {
+                    location: f.location.location(),
+                },
+                f.location
+                    .file()
+                    .map(|path| (FileSlot::Attachment, path))
+                    .into_iter()
+                    .collect(),
+            ),
         }
     }
 }
@@ -612,6 +637,8 @@ enum UiAction {
     Requeue(Uuid),
     OpenFinish(Uuid),
     OpenNote(Uuid, NoteKind),
+    /// Opens the form that adds an extra file to a request.
+    OpenAttach(Uuid),
     OpenUrl(String),
     Download(FileRef),
     Duplicate(Uuid),
@@ -2439,6 +2466,40 @@ impl App {
                             ui.label(clean_text(&request.description));
                         }
 
+                        theme::section(ui, t("Fler filer", "More files"));
+                        if request.attachments.is_empty() {
+                            ui.weak(t("Inga fler filer", "No more files"));
+                        }
+                        for attachment in &request.attachments {
+                            // Who added it, as the label in front of the file.
+                            let label = truncate_chars(&one_line(&attachment.by), 12);
+                            location_field(ui, &icons, &label, Some(&attachment.location), actions);
+                        }
+                        let room = request.attachments.len() < MAX_ATTACHMENTS;
+                        if ui
+                            .add_enabled(
+                                can_write && room,
+                                icons
+                                    .button(
+                                        ui,
+                                        theme::Icon::Plus,
+                                        t("Lägg till fil…", "Add file…"),
+                                        "",
+                                    )
+                                    .small(),
+                            )
+                            .on_disabled_hover_text(if room {
+                                why.to_string()
+                            } else if is_en() {
+                                format!("A request can have at most {MAX_ATTACHMENTS} more files")
+                            } else {
+                                format!("En förfrågan kan ha högst {MAX_ATTACHMENTS} fler filer")
+                            })
+                            .clicked()
+                        {
+                            actions.push(UiAction::OpenAttach(id));
+                        }
+
                         ui.add_space(14.0);
                         ui.horizontal_wrapped(|ui| {
                             let button = |ui: &mut egui::Ui, label: &str| {
@@ -2586,6 +2647,7 @@ impl App {
                         Form::New(f) => new_form_ui(ui, f, &self.snapshot),
                         Form::Finish(f) => finish_form_ui(ui, f),
                         Form::Note(f) => note_form_ui(ui, f),
+                        Form::Attach(f) => attach_form_ui(ui, f),
                     });
                 ui.add_space(6.0);
                 if let Some(error) = &self.form_error {
@@ -3161,6 +3223,21 @@ impl App {
                             report: LocInput::default(),
                             results: LocInput::default(),
                             summary: String::new(),
+                        }));
+                    }
+                }
+                UiAction::OpenAttach(id) => {
+                    if let Some(request) =
+                        self.snapshot.requests.iter().find(|r| r.request_id == id)
+                    {
+                        self.form_error = None;
+                        self.form = Some(Form::Attach(AttachForm {
+                            request_id: id,
+                            title: request.title.clone(),
+                            location: LocInput {
+                                kind: LocKind::File,
+                                ..LocInput::default()
+                            },
                         }));
                     }
                 }
@@ -3836,6 +3913,15 @@ fn new_form_ui(ui: &mut egui::Ui, f: &mut NewForm, snapshot: &Snapshot) {
     loc_input_ui(ui, "input_kind", &mut f.input);
 }
 
+fn attach_form_ui(ui: &mut egui::Ui, f: &mut AttachForm) {
+    ui.label(t(
+        "Lägg till en fil till förfrågan, till exempel en CAD-fil eller ett lastfall. Den syns för alla i laget.",
+        "Add a file to the request, for example a CAD file or a load case. Everyone on the team can see it.",
+    ));
+    ui.add_space(6.0);
+    loc_input_ui(ui, "attach_kind", &mut f.location);
+}
+
 fn finish_form_ui(ui: &mut egui::Ui, f: &mut FinishForm) {
     ui.label(RichText::new(t("Utförare", "Assignee")).strong());
     ui.add(
@@ -4043,6 +4129,29 @@ mod tests {
                 assert!(f.part.is_some());
             }
             _ => panic!("the duplicate should open the new request form"),
+        }
+        app.form = None;
+
+        // The form for an extra file starts on an uploaded file and needs one.
+        app.apply(&ctx, vec![UiAction::OpenAttach(request)]);
+        frame(&ctx, &mut app);
+        match &mut app.form {
+            Some(form @ Form::Attach(_)) => {
+                assert!(form.problem().is_some(), "no file chosen yet");
+                if let Form::Attach(f) = form {
+                    f.location.kind = LocKind::Vault;
+                    f.location.value = "CAD/upright.iam".to_string();
+                }
+                assert_eq!(form.problem(), None);
+                let (id, action, files) = form.action();
+                assert_eq!(id, Some(request));
+                assert!(files.is_empty());
+                assert!(matches!(
+                    action,
+                    NewAction::Attach { location: Some(l) } if l.kind == LocKind::Vault
+                ));
+            }
+            _ => panic!("the attach form should open"),
         }
         app.form = None;
 

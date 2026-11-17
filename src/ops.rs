@@ -23,7 +23,7 @@ use crate::model::{
 /// Largest allowed size of an event file.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// Highest event version this app understands.
-pub const SUPPORTED_V: u32 = 4;
+pub const SUPPORTED_V: u32 = 5;
 /// Events that refer to uploaded files use this version, so that apps too old
 /// to handle files ignore them and ask for an update instead of rejecting them.
 pub const FILES_V: u32 = 2;
@@ -32,6 +32,9 @@ pub const FILES_V: u32 = 2;
 pub const BOARD_V: u32 = 3;
 /// Departments that point at regions of the car drawing use this version.
 pub const REGIONS_V: u32 = 4;
+/// Extra files on a request use this version. Older apps ignore them, so the
+/// request itself stays visible to them.
+pub const ATTACH_V: u32 = 5;
 /// Highest folder format this app may write to.
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -106,6 +109,10 @@ pub enum Action {
     /// Creates a part or replaces its name, status and note.
     PartSet(Box<PartPayload>),
     PartDelete,
+    /// Adds an extra file to a request.
+    Attach {
+        location: Location,
+    },
     /// Unknown `kind` or a higher `v` than the app knows: stored but has no effect.
     Unsupported,
     /// Known `kind` but invalid content: rejected at replay with this reason.
@@ -240,6 +247,13 @@ struct NoteWire {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyWire {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachWire {
+    file_kind: String,
+    file_ref: String,
+}
 
 fn check_text(field: &str, value: &str, max: usize, required: bool) -> Result<(), String> {
     if char_len(value) > max {
@@ -406,6 +420,12 @@ fn parse_action(kind: &str, payload: Value) -> Action {
             .and_then(validate_part)
             .map(|p| Action::PartSet(Box::new(p))),
         OpKind::PartDelete => from_payload::<EmptyWire>(payload).map(|_| Action::PartDelete),
+        OpKind::Attach => from_payload::<AttachWire>(payload).and_then(|w| {
+            let location = parse_location(&w.file_kind, &w.file_ref)
+                .map_err(|e| format!("{}: {e}", t("fil", "file")))?
+                .ok_or_else(|| t("filen saknas", "the file is missing").to_string())?;
+            Ok(Action::Attach { location })
+        }),
     };
     result.unwrap_or_else(|e| Action::Invalid(truncate_chars(&e, 300)))
 }
@@ -552,6 +572,11 @@ pub enum NewAction {
         note: String,
     },
     PartDelete,
+    /// Adds an extra file to a request. `None` until the file to upload has
+    /// been imported.
+    Attach {
+        location: Option<Location>,
+    },
 }
 
 fn loc_wire(loc: &Option<Location>) -> (&str, &str) {
@@ -571,6 +596,7 @@ impl Action {
         match self {
             Action::Create(p) => is_file(&p.input),
             Action::Finish(p) => p.report.kind == LocKind::File || is_file(&p.results),
+            Action::Attach { location } => location.kind == LocKind::File,
             _ => false,
         }
     }
@@ -578,6 +604,7 @@ impl Action {
     /// The lowest event version that may carry this action.
     pub fn min_version(&self) -> u32 {
         match self {
+            Action::Attach { .. } => ATTACH_V,
             Action::Comment { .. }
             | Action::DeptDelete
             | Action::PartSet(_)
@@ -599,6 +626,7 @@ impl NewAction {
             NewAction::Finish {
                 report, results, ..
             } => is_file(report) || is_file(results),
+            NewAction::Attach { location } => is_file(location),
             _ => false,
         }
     }
@@ -617,11 +645,13 @@ impl NewAction {
             NewAction::DeptDelete => OpKind::DeptDelete,
             NewAction::PartSet { .. } => OpKind::PartSet,
             NewAction::PartDelete => OpKind::PartDelete,
+            NewAction::Attach { .. } => OpKind::Attach,
         }
     }
 
     fn version(&self) -> u32 {
         match self {
+            NewAction::Attach { .. } => ATTACH_V,
             NewAction::Comment { .. }
             | NewAction::DeptDelete
             | NewAction::PartSet { .. }
@@ -693,6 +723,10 @@ impl NewAction {
             }
             NewAction::Requeue | NewAction::DeptDelete | NewAction::PartDelete => json!({}),
             NewAction::Comment { text } => json!({ "text": text }),
+            NewAction::Attach { location } => {
+                let (file_kind, file_ref) = loc_wire(location);
+                json!({ "file_kind": file_kind, "file_ref": file_ref })
+            }
             NewAction::DeptSet {
                 name,
                 color,
@@ -1654,6 +1688,60 @@ mod tests {
         assert!(matches!(
             board("comment", json!({"text": "Hej"})),
             Action::Comment { .. }
+        ));
+    }
+
+    #[test]
+    fn extra_files_need_their_own_event_version() {
+        let client = Uuid::new_v4();
+        let link = NewAction::Attach {
+            location: Some(Location {
+                kind: LocKind::Drive,
+                value: "https://drive.google.com/lastfall".to_string(),
+            }),
+        };
+        let op = build_op(client, hlc(1, 0), "A", Uuid::new_v4(), &link).unwrap();
+        assert_eq!(op.v, ATTACH_V);
+        assert!(
+            matches!(&op.action, Action::Attach { location } if location.kind == LocKind::Drive)
+        );
+        // Older versions may not carry it.
+        let mut value: Value = serde_json::from_str(&op.json).unwrap();
+        value["v"] = json!(REGIONS_V);
+        assert!(matches!(
+            Op::parse(&value.to_string()).unwrap().action,
+            Action::Invalid(_)
+        ));
+        // A missing file, a dangerous link or an extra field is refused.
+        let empty = build_op(
+            client,
+            hlc(2, 0),
+            "A",
+            Uuid::new_v4(),
+            &NewAction::Attach { location: None },
+        )
+        .unwrap();
+        assert!(matches!(empty.action, Action::Invalid(_)));
+        let with = |payload: Value| {
+            let mut value: Value = serde_json::from_str(&op.json).unwrap();
+            value["payload"] = payload;
+            Op::parse(&value.to_string()).unwrap().action
+        };
+        assert!(matches!(
+            with(json!({"file_kind": "drive", "file_ref": "javascript:alert(1)"})),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            with(json!({"file_kind": "file", "file_ref": "inte en referens"})),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            with(json!({"file_kind": "vault", "file_ref": "CAD/upright.iam", "extra": 1})),
+            Action::Invalid(_)
+        ));
+        assert!(matches!(
+            with(json!({"file_kind": "vault", "file_ref": "CAD/upright.iam"})),
+            Action::Attach { .. }
         ));
     }
 

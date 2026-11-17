@@ -9,6 +9,10 @@ const NOTES: &[(&str, &[(&str, &str)])] = &[(
     "0.6.0",
     &[
         (
+            "Flera filer per förfrågan: öppna en förfrågan och klicka Lägg till fil… under Fler filer. Den som har en äldre version ser inte de nya filerna förrän de uppdaterar.",
+            "Several files per request: open a request and click Add file… under More files. Team members on an older version do not see the new files until they update.",
+        ),
+        (
             "Fliken Arkiv: förfrågningar som blev klara för mer än 30 dagar sedan flyttas dit, så att de andra flikarna hålls korta. Inget tas bort.",
             "The Archive tab: requests that finished more than 30 days ago move there, so the other tabs stay short. Nothing is deleted.",
         ),

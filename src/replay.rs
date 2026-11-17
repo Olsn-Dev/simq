@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::i18n::{is_en, t};
 
-use crate::model::{Comment, Department, OpKind, Part, PartStatus, Request, Status};
+use crate::model::{
+    Attachment, Comment, Department, OpKind, Part, PartStatus, Request, Status, MAX_ATTACHMENTS,
+};
 use crate::ops::{Action, Op};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +166,7 @@ impl State {
                         last_by: op.by.clone(),
                         last_kind: OpKind::Create,
                         comments: Vec::new(),
+                        attachments: Vec::new(),
                         created_by: op.client_id,
                         changed_at: op.hlc.wall_ms,
                         changed_by: op.client_id,
@@ -401,6 +404,29 @@ fn transition(request: &mut Request, op: &Op) -> Outcome {
         touch(request, op);
         return Outcome::Applied;
     }
+    if let Action::Attach { location } = &op.action {
+        // Like a comment: allowed in every status, and not a status change.
+        if request.attachments.len() >= MAX_ATTACHMENTS {
+            return Outcome::Rejected {
+                reason: Reject::Invalid(
+                    t(
+                        "ärendet har redan så många filer det får ha",
+                        "the request already has as many files as it may have",
+                    )
+                    .to_string(),
+                ),
+                blocker: None,
+            };
+        }
+        request.attachments.push(Attachment {
+            op_id: op.op_id,
+            at_ms: at,
+            by: op.by.clone(),
+            location: location.clone(),
+        });
+        touch(request, op);
+        return Outcome::Applied;
+    }
     let kind = match &op.action {
         Action::Take { assignee } if status == Status::Queued => {
             request.status = Status::Running;
@@ -492,6 +518,35 @@ mod tests {
             state.outcomes.get(&op.op_id),
             Some(Outcome::Rejected { reason: Reject::WrongStatus(s), .. }) if *s == status
         )
+    }
+
+    #[test]
+    fn a_request_has_at_most_so_many_extra_files() {
+        let a = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let mut ops = vec![op_at(a, 1000, 0, "Anna", id, &create_action("Upright"))];
+        let attach = NewAction::Attach {
+            location: Some(Location {
+                kind: LocKind::Vault,
+                value: "CAD/upright.iam".to_string(),
+            }),
+        };
+        for i in 0..=crate::model::MAX_ATTACHMENTS as u64 {
+            ops.push(op_at(a, 2000 + i, 0, "Anna", id, &attach));
+        }
+        let last = ops.last().unwrap().op_id;
+        let state = replay(ops);
+        assert_eq!(
+            state.requests[&id].attachments.len(),
+            crate::model::MAX_ATTACHMENTS
+        );
+        assert!(matches!(
+            state.outcomes[&last],
+            Outcome::Rejected {
+                reason: Reject::Invalid(_),
+                ..
+            }
+        ));
     }
 
     #[test]

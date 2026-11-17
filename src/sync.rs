@@ -519,6 +519,7 @@ impl Client {
                 (NewAction::Create { input, .. }, FileSlot::Input) => *input = location,
                 (NewAction::Finish { report, .. }, FileSlot::Report) => *report = location,
                 (NewAction::Finish { results, .. }, FileSlot::Results) => *results = location,
+                (NewAction::Attach { location: slot }, FileSlot::Attachment) => *slot = location,
                 _ => {
                     return Err(t(
                         "Filen passar inte till den här åtgärden.",
@@ -676,6 +677,15 @@ impl Client {
                     truncate_chars(&one_line(&p.name), 60),
                     p.status.label()
                 ),
+                (ops::Action::Attach { location }, Some(kind)) => {
+                    let name = match location.kind {
+                        LocKind::File => blobs::FileRef::parse(&location.value)
+                            .map(|f| f.name)
+                            .unwrap_or_default(),
+                        _ => location.value.clone(),
+                    };
+                    format!("{}: {}", kind.label(), truncate_chars(&one_line(&name), 60))
+                }
                 (_, Some(kind)) => kind.label().to_string(),
                 (_, None) => format!(
                     "{} ({})",
@@ -769,6 +779,7 @@ fn orphan_files(state: &State) -> Vec<blobs::FileRef> {
         [&r.input, &r.report, &r.results]
             .into_iter()
             .flatten()
+            .chain(r.attachments.iter().map(|a| &a.location))
             .filter(|l| l.kind == LocKind::File)
             .filter_map(|l| blobs::FileRef::parse(&l.value))
             .collect::<Vec<_>>()
@@ -854,6 +865,8 @@ pub enum FileSlot {
     Input,
     Report,
     Results,
+    /// An extra file on a request.
+    Attachment,
 }
 
 /// Where the events should be synced.
@@ -1921,6 +1934,61 @@ mod tests {
             fs::read_dir(shared.path().join(OPS_DIR)).unwrap().count(),
             1
         );
+    }
+
+    #[test]
+    fn extra_files_are_added_uploaded_and_cleaned() {
+        let shared = TempDir::new();
+        let source = TempDir::new();
+        let mut a = client(shared.path(), "Anna");
+        let mut b = client(shared.path(), "Bo");
+        let id = applied(a.submit(None, &create_action("Upright")));
+        let cad = source.path().join("upright.step");
+        std::fs::write(&cad, b"solid upright").unwrap();
+        let attach = || NewAction::Attach { location: None };
+        applied(a.submit_with_files(
+            Some(id),
+            attach(),
+            vec![(FileSlot::Attachment, cad.clone())],
+        ));
+        let link = NewAction::Attach {
+            location: Some(Location {
+                kind: LocKind::Drive,
+                value: "https://drive.google.com/lastfall".to_string(),
+            }),
+        };
+        applied(a.submit(Some(id), &link));
+
+        // Another app sees both, in order, and the history names the file.
+        b.sync();
+        let snapshot = b.snapshot();
+        let request = snapshot
+            .requests
+            .iter()
+            .find(|r| r.request_id == id)
+            .unwrap();
+        assert_eq!(request.attachments.len(), 2);
+        let file = blobs::FileRef::parse(&request.attachments[0].location.value).unwrap();
+        assert_eq!(file.name, "upright.step");
+        assert_eq!(request.attachments[1].location.kind, LocKind::Drive);
+        assert_eq!(request.attachments[0].by, "Anna");
+        assert!(snapshot.history[&id]
+            .iter()
+            .any(|h| h.what.ends_with("upright.step")));
+        // Adding a file is not a change of status.
+        assert_eq!(request.status, Status::Queued);
+        assert_eq!(request.last_kind, crate::model::OpKind::Create);
+
+        // A file that only a deleted request has is offered for cleaning.
+        applied(b.submit(
+            Some(id),
+            &NewAction::Delete {
+                note: String::new(),
+            },
+        ));
+        let orphans = b.snapshot().orphan_files;
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].name, "upright.step");
     }
 
     #[test]

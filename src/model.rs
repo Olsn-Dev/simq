@@ -23,6 +23,8 @@ pub const MAX_REGIONS: usize = 32;
 pub const MAX_REGION_ID: usize = 32;
 /// Number of colours a department can choose between.
 pub const COLOR_COUNT: u8 = 10;
+/// Most extra files a request can have, besides input, report and results.
+pub const MAX_ATTACHMENTS: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
@@ -74,6 +76,7 @@ pub enum OpKind {
     DeptDelete,
     PartSet,
     PartDelete,
+    Attach,
 }
 
 impl OpKind {
@@ -91,6 +94,7 @@ impl OpKind {
             OpKind::DeptDelete => "dept_delete",
             OpKind::PartSet => "part_set",
             OpKind::PartDelete => "part_delete",
+            OpKind::Attach => "attach",
         }
     }
 
@@ -108,6 +112,7 @@ impl OpKind {
             "dept_delete" => OpKind::DeptDelete,
             "part_set" => OpKind::PartSet,
             "part_delete" => OpKind::PartDelete,
+            "attach" => OpKind::Attach,
             _ => return None,
         })
     }
@@ -130,6 +135,7 @@ impl OpKind {
             OpKind::DeptDelete => t("Tog bort avdelningen", "Deleted the department"),
             OpKind::PartSet => t("Ändrade delen", "Changed the part"),
             OpKind::PartDelete => t("Tog bort delen", "Deleted the part"),
+            OpKind::Attach => t("Lade till en fil", "Added a file"),
         }
     }
 
@@ -151,6 +157,7 @@ impl OpKind {
             OpKind::DeptDelete => t("tog bort avdelningen", "deleted the department"),
             OpKind::PartSet => t("ändrade delen", "changed the part"),
             OpKind::PartDelete => t("tog bort delen", "deleted the part"),
+            OpKind::Attach => t("lade till en fil", "added a file"),
         }
     }
 }
@@ -382,6 +389,8 @@ pub struct Request {
     pub last_by: String,
     pub last_kind: OpKind,
     pub comments: Vec<Comment>,
+    /// Extra files, in the order they were added.
+    pub attachments: Vec<Attachment>,
     /// The app that created the request.
     pub created_by: Uuid,
     /// When the request last changed (comments included), and by which app.
@@ -396,6 +405,15 @@ pub struct Comment {
     pub at_ms: u64,
     pub by: String,
     pub text: String,
+}
+
+/// An extra file on a request, for example a CAD file next to a load case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub op_id: Uuid,
+    pub at_ms: u64,
+    pub by: String,
+    pub location: Location,
 }
 
 /// A rectangle on the car drawing, in the drawing's own units.
