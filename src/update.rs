@@ -26,14 +26,86 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// How this copy of the app was installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Install {
+    /// From the Microsoft Store (an MSIX package). The Store updates it.
+    Store,
+    /// From the Linux package (.deb), in a system folder the app may not
+    /// write to. A new package is installed instead.
+    LinuxPackage,
+    /// Any other way. The app updates itself from GitHub Releases.
+    Portable,
+}
+
+/// Whether this copy runs inside an MSIX package from the Microsoft Store.
+pub fn install_kind() -> Install {
+    #[cfg(windows)]
+    if runs_in_package() {
+        return Install::Store;
+    }
+    if cfg!(target_os = "linux")
+        && appimage().is_none()
+        && current_exe().is_ok_and(|exe| exe.starts_with("/usr"))
+    {
+        return Install::LinuxPackage;
+    }
+    Install::Portable
+}
+
+/// The AppImage file the app was started from, if any. The program itself
+/// then lies in a read-only folder, so an update replaces the AppImage.
+fn appimage() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+}
+
+/// Asks Windows for the name of the package the program runs in. Outside a
+/// package Windows answers APPMODEL_ERROR_NO_PACKAGE.
+#[cfg(windows)]
+fn runs_in_package() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentPackageFullName(length: *mut u32, name: *mut u16) -> i32;
+    }
+    const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
+    let mut length = 0u32;
+    // SAFETY: with a length of 0 Windows writes nothing to the null buffer;
+    // it only reports how long the name is, or that there is no package.
+    let result = unsafe { GetCurrentPackageFullName(&mut length, std::ptr::null_mut()) };
+    result != APPMODEL_ERROR_NO_PACKAGE
+}
+
+/// The app's page in the Microsoft Store, when the release was built with
+/// its product id (from Partner Center) in `SIMQ_STORE_PRODUCT_ID`.
+pub fn store_page() -> Option<String> {
+    store_page_for(option_env!("SIMQ_STORE_PRODUCT_ID"))
+}
+
+fn store_page_for(product_id: Option<&str>) -> Option<String> {
+    let id = product_id?.trim();
+    let valid = !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_alphanumeric());
+    valid.then(|| format!("ms-windows-store://pdp/?ProductId={id}"))
+}
+
 /// Name of the release file for this platform, if automatic update is supported.
 pub fn asset_name() -> Option<&'static str> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some("simq-macos-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("simq-macos-x64")
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         Some("simq-windows-x64.exe")
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Some("simq-linux-x64")
+        Some(if appimage().is_some() {
+            "simq-linux-x64.AppImage"
+        } else {
+            "simq-linux-x64"
+        })
     } else {
         None
     }
@@ -342,13 +414,21 @@ fn current_exe() -> Result<PathBuf, String> {
 /// Downloads and installs `available`. Returns the installed version.
 pub fn download_and_install(available: &Available, token: Option<&str>) -> Result<String, String> {
     let bytes = download(available, token)?;
-    install_at(&current_exe()?, &bytes)?;
+    let target = match appimage() {
+        Some(file) => file,
+        None => current_exe()?,
+    };
+    install_at(&target, &bytes)?;
     Ok(available.version.clone())
 }
 
 /// Starts the (new) program with the same arguments. The caller then closes this one.
 pub fn restart() -> Result<(), String> {
-    std::process::Command::new(current_exe()?)
+    let program = match appimage() {
+        Some(file) => file,
+        None => current_exe()?,
+    };
+    std::process::Command::new(program)
         .args(std::env::args_os().skip(1))
         .spawn()
         .map(|_| ())
@@ -436,6 +516,21 @@ mod tests {
         let loose = tmp.path().join("simq");
         std::fs::write(&loose, b"program").unwrap();
         assert!(!refresh_bundle_icon(&loose, b"new icon"));
+    }
+
+    #[test]
+    fn the_store_page_needs_a_plain_product_id() {
+        assert_eq!(
+            store_page_for(Some("9NBLGGH4R32N")).as_deref(),
+            Some("ms-windows-store://pdp/?ProductId=9NBLGGH4R32N")
+        );
+        assert_eq!(store_page_for(None), None);
+        assert_eq!(store_page_for(Some("")), None);
+        assert_eq!(store_page_for(Some("9N&x=javascript")), None);
+        // Outside Windows the app is never a Store copy.
+        if !cfg!(windows) {
+            assert_eq!(install_kind(), Install::Portable);
+        }
     }
 
     #[test]

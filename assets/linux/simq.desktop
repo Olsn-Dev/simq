@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SimQ
+GenericName=Simulation queue
+Comment=Queue for simulation requests in a Formula Student team
+Comment[sv]=Kö för simuleringsförfrågor i ett Formula Student-lag
+Exec=simq
+Icon=simq
+Terminal=false
+Categories=Office;ProjectManagement;
+StartupWMClass=simq
