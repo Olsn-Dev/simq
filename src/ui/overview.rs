@@ -38,12 +38,14 @@ pub(super) struct BoardUi {
     /// The line art of the car, loaded when the app starts.
     pub(super) drawing: Option<egui::TextureHandle>,
     pub(super) icons: theme::Icons,
+    /// The part whose history is shown in a window.
+    history: Option<Uuid>,
 }
 
 impl BoardUi {
     /// Esc: leaves the choosing of regions, else goes back to all departments.
     pub(super) fn escape(&mut self) {
-        if self.text_edit.take().is_some() {
+        if self.history.take().is_some() || self.text_edit.take().is_some() {
             return;
         }
         if self.place.take().is_none() {
@@ -88,6 +90,7 @@ enum BoardAction {
     EditText(Uuid, EditWhat, String),
     SaveText,
     CancelText,
+    ShowHistory(Uuid),
 }
 
 /// Suggested departments: (Swedish, English, regions of the car).
@@ -211,6 +214,7 @@ impl App {
         egui::CentralPanel::default().show(ctx, |ui| {
             canvas_ui(ui, &mut self.board, &snapshot, can_write, &mut out);
         });
+        history_ui(ctx, &mut self.board, &snapshot);
         for action in out {
             self.apply_board(&snapshot, action);
         }
@@ -364,6 +368,7 @@ impl App {
                 self.board.text_edit = Some(TextEdit { target, what, text });
             }
             BoardAction::CancelText => self.board.text_edit = None,
+            BoardAction::ShowHistory(id) => self.board.history = Some(id),
             BoardAction::SaveText => {
                 let Some(edit) = self.board.text_edit.take() else {
                     return;
@@ -758,6 +763,10 @@ fn dept_ui(
                             actions.push(UiAction::NewRequest(Some(dept.id), Some(part.id)));
                             ui.close_menu();
                         }
+                        if ui.button(t("Historik…", "History…")).clicked() {
+                            out.push(BoardAction::ShowHistory(part.id));
+                            ui.close_menu();
+                        }
                         if ui.button(t("Ta bort…", "Delete…")).clicked() {
                             out.push(BoardAction::DeletePart(part.id));
                             ui.close_menu();
@@ -996,6 +1005,63 @@ fn toggle(regions: &mut Vec<String>, id: &str) {
         regions.retain(|r| r != id);
     } else {
         regions.push(id.to_string());
+    }
+}
+
+/// Who changed a part and when: every saved name, status and note, oldest first.
+fn history_ui(ctx: &egui::Context, board: &mut BoardUi, snapshot: &Snapshot) {
+    let Some(id) = board.history else {
+        return;
+    };
+    let Some(part) = snapshot.parts.iter().find(|p| p.id == id) else {
+        board.history = None;
+        return;
+    };
+    let mut open = true;
+    let room = (ctx.screen_rect().height() - 60.0).max(160.0);
+    egui::Window::new(format!(
+        "{}: {}",
+        t("Historik", "History"),
+        truncate_chars(&one_line(&part.name), 40)
+    ))
+    .id(egui::Id::new("part_history"))
+    .open(&mut open)
+    .collapsible(false)
+    .default_width(420.0)
+    .max_height(room)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .show(ctx, |ui| {
+        let entries = snapshot.history.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+        if entries.is_empty() {
+            ui.weak(t("Ingen historik ännu.", "No history yet."));
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for entry in entries {
+                    ui.horizontal_wrapped(|ui| {
+                        theme::dot(
+                            ui,
+                            if entry.problem.is_some() {
+                                ui.visuals().warn_fg_color
+                            } else {
+                                ui.visuals().weak_text_color()
+                            },
+                        );
+                        ui.weak(super::format_time(entry.at_ms));
+                        ui.label(RichText::new(one_line(&entry.by)).strong());
+                        ui.label(&entry.what);
+                    });
+                    if let Some(problem) = &entry.problem {
+                        ui.indent(("part_problem", entry.at_ms, &entry.by), |ui| {
+                            ui.colored_label(ui.visuals().warn_fg_color, problem);
+                        });
+                    }
+                }
+            });
+    });
+    if !open {
+        board.history = None;
     }
 }
 
@@ -1462,6 +1528,32 @@ mod tests {
         frame(ctx, board, snapshot, vec![egui::Event::PointerMoved(pos)]);
         frame(ctx, board, snapshot, vec![button(true)]);
         frame(ctx, board, snapshot, vec![button(false)])
+    }
+
+    #[test]
+    fn the_history_of_a_part_opens_and_closes() {
+        let dir = TempDir::new();
+        let (snapshot, _, _) = snapshot(&dir);
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let part = snapshot.parts[0].id;
+        let mut board = BoardUi {
+            history: Some(part),
+            ..BoardUi::default()
+        };
+        assert_eq!(snapshot.history[&part].len(), 1);
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            history_ui(ctx, &mut board, &snapshot)
+        });
+        assert_eq!(board.history, Some(part));
+        board.escape();
+        assert_eq!(board.history, None);
+        // A part that is gone closes the window by itself.
+        board.history = Some(Uuid::new_v4());
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            history_ui(ctx, &mut board, &snapshot)
+        });
+        assert_eq!(board.history, None);
     }
 
     #[test]
