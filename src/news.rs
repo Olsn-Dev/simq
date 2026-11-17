@@ -33,6 +33,10 @@ const NOTES: &[(&str, &[(&str, &str)])] = &[(
             "The regions of the car can be chosen with the keyboard, and the buttons have names for screen readers.",
         ),
         (
+            "Teamnyckeln sparas i Nyckelringen (macOS) eller Autentiseringshanteraren (Windows) i stället för i inställningsfilen.",
+            "The team key is kept in the Keychain (macOS) or the Credential Manager (Windows) instead of in the settings file.",
+        ),
+        (
             "Appen frågar GitHub mer sällan när fönstret ligger i bakgrunden.",
             "The app asks GitHub less often while the window is in the background.",
         ),

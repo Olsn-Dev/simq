@@ -22,8 +22,8 @@
 - **No server.** The team syncs through a private GitHub repository or a shared folder.
 - **Works offline.** Changes are sent when the network is back.
 - **No clashes.** If two people take the same request at the same time, everyone ends up with the same winner.
-- **Swedish and English.** Each person chooses their own language.
-- **Small and self-contained** for Windows, macOS and Linux: an installer on Windows, a disk image on macOS.
+- **Swedish and English.** Each person chooses their own language. A new installation starts in the computer's language.
+- **Small and self-contained** for Windows, macOS and Linux: a single program on Windows, a disk image on macOS, a package or AppImage on Linux.
 
 **Contents:** [How it works](#how-it-works) · [The overview](#the-overview) · [Get started with GitHub](#get-started-with-github) · [Shared folder](#get-started-with-a-shared-folder-alternative) · [Download](#download-and-start) · [Updating](#updating) · [Good to know](#good-to-know) · [For developers](#for-developers)
 
@@ -53,12 +53,16 @@ For every file (input, report, results) you choose how to point to it. You can u
 ### Departments, filters and comments
 
 - **Department and part.** A new request can say which department asks for it and which part of the car it is about. Both are optional.
-- **Filters.** Above the queue you can filter on department, simulation type, priority and person, show only your own requests, and search. Click a column heading to sort by it; click again to reverse, and a third time to go back to the usual order. Filters and sorting are yours alone and are not synced.
+- **Filters.** Above the queue you can filter on department, simulation type, priority and person, show only your own requests or those due soon, and search. Click a column heading to sort by it; click again to reverse, and a third time to go back to the usual order. Filters and sorting are yours alone and are not synced.
 - **Comments.** Open a request and write at the bottom of it. Questions and answers stay with the request.
 - **New for you.** A blue dot marks your own requests (the ones you created or took) that someone else has changed or commented on since you last opened them. The "New for you" filter shows only those.
+- **Deadlines.** A line above the queue points out active requests whose deadline has passed or is at most three days away. **Show them** (or the **Due soon** filter) lists only those.
+- **Archive.** Requests that finished more than 30 days ago move to the **Archive** tab, so the other tabs stay short. Nothing is deleted, and a search in **All** still finds them.
+- **More files.** Besides input, report and results, a request can have up to 20 more files: open it and click **Add file…** under **More files**. Team members on a version older than 0.6.0 do not see them until they update.
 - **Duplicate.** A request cannot be edited, but **Duplicate…** opens a new one filled in from it.
 - **Export CSV.** Saves the list as it is shown, for Excel or a meeting. The file uses semicolons between the columns.
 - **Room for the request.** When a request is open beside the queue, the least important columns are hidden instead of cut off. They come back when you close it.
+- **New in this version.** After an update, a window lists what changed, once.
 - **Shortcuts.** Ctrl+N (⌘N on a Mac) starts a new request, Ctrl+F goes to the search field, Ctrl+1, 2 and 3 switch between Queue, Overview and Statistics, and Esc closes what is open.
 - **It remembers.** The window size and position, the column widths, the page you were on, the tab and the filters are kept between starts.
 
@@ -70,7 +74,9 @@ The **Overview** page shows a drawing of a formula car, from the side and from a
 
 1. **Add a department.** A department works like a folder. Type a name under "New department", or click **Add suggestions** to get Aero, Chassis, Suspension, Powertrain and Electronics, already placed on the car. Everything can be changed afterwards.
 2. **Place it on the car.** Click the parts of the car that belong to the department: front wing, nose, front suspension, front wheels, monocoque and cockpit, sidepods, floor, engine cover, rear suspension, rear wheels and rear wing. Each part follows the shape of the car and is the same part in both views. A department can have several parts, and a part belongs to one department at a time. Click a part again to remove it, then **Save**. A new department goes straight to this step.
-3. **Add its parts.** Each part in the list has a status: Not started, Design, Simulation, Manufacturing or Done. Change it as the work moves on. A part can also have a short note.
+3. **Add its parts.** Each part in the list has a status: Not started, Design, Simulation, Manufacturing or Done. Change it as the work moves on. A part can also have a short note, and **History…** in its menu shows who changed it and when.
+
+The parts of the car can also be chosen with the check boxes above the drawing, which work from the keyboard.
 
 The colour of a department's shapes shows how far its parts have come, from red over amber to green. A red badge with a number shows how many simulation requests the department has open. Grey means the department has no parts yet. Point at a shape to light up everything that belongs to the same department, in both views. Click it to open the department. From there you can also create a simulation request for the department or for one part, and see its open requests. A click between the shapes does nothing.
 
@@ -113,9 +119,9 @@ Tip: if you put a text file called `simq-teamkey.txt` containing the team key in
 
 Get the latest version for your system under **Releases** on the GitHub page:
 
-- **Windows:** run the `-setup.exe` installer. It installs SimQ for your user only, without administrator rights, and adds a Start menu shortcut and an uninstaller. There is also a zip file with just `SimQ.exe` if you prefer not to install.
-- **macOS:** open the `.dmg` file and drag `SimQ` to Applications.
-- **Linux:** unpack the `tar.gz` file and run `./simq`.
+- **Windows:** download `simq-windows-x64.exe` and put it where you like, for example in a folder of its own. It is the whole app: double-click it to start. Nothing is installed.
+- **macOS:** open the `.dmg` file and drag `SimQ` to Applications. It runs on both Apple Silicon and Intel Macs.
+- **Linux:** install the `.deb` package (Debian, Ubuntu), or download the `.AppImage` file, make it executable and run it.
 
 The app is a single self-contained program. Nothing else needs to be installed.
 
@@ -141,13 +147,13 @@ xattr -dr com.apple.quarantine /Applications/SimQ.app
 
 The app looks for a newer version every time it starts. When there is one, an **Update to …** button appears at the top right. Click it, wait for the download, and click **Restart**. You can also look manually under **Settings → Check for updates**.
 
-The update is downloaded from this repository's Releases page. For that to work the repository must be public, or the team key must also be allowed to read it (Contents: Read-only). On macOS the app has to be in a folder you can write to, such as Applications, not opened straight from the disk image.
+The update is downloaded from this repository's Releases page. For that to work the repository must be public, or the team key must also be allowed to read it (Contents: Read-only). On macOS the app has to be in a folder you can write to, such as Applications, not opened straight from the disk image. The `.deb` package does not update itself: install the new package instead.
 
 ## Good to know
 
 ### It takes a moment before other people's changes show up
 
-The app looks for news every 15 seconds, when the window gets focus and when you click **Sync now**. With GitHub, other people's changes normally show up within half a minute. With a shared folder, Drive also needs time, so expect a few seconds up to a minute. The status bar at the bottom shows when the app last synced.
+The app looks for news every 15 seconds, when the window gets focus and when you click **Sync now**. While the window is in the background it asks GitHub only every 90 seconds, which is kinder to GitHub's limits when the whole team keeps the app open. With GitHub, other people's changes normally show up within half a minute. With a shared folder, Drive also needs time, so expect a few seconds up to a minute. The status bar at the bottom shows when the app last synced.
 
 ### "Someone got there first"
 
@@ -195,7 +201,9 @@ Uploaded files that belonged only to deleted requests can be removed under **Set
 
 Under **Settings → Diagnostics** you can see the number of events, the last sync, how many changes are waiting to be sent, files that could not be read and events that were rejected. The **Rebuild cache** button empties the app's local database and reads everything again. It is harmless: the database is only a copy.
 
-If you see "GitHub denied access", the team key has probably expired. Ask whoever set up the repository for a new one and paste it under Settings.
+Two weeks before the team key expires, the status bar says so. If you see "GitHub denied access", the team key has probably expired. Ask whoever set up the repository for a new one and paste it under Settings.
+
+On macOS and Windows the team key is kept in the Keychain or the Credential Manager, not in the settings file. On macOS, after an update, the Keychain may ask once whether SimQ may read it: click **Always Allow**.
 
 If you see "A new version of the app is available" or "Update the app", someone on the team has a newer version. Download the latest from Releases.
 
@@ -225,7 +233,7 @@ git tag v0.1.0 && git push origin v0.1.0
 
 The car on the overview page is `assets/car.png`: white line art on a transparent background, tinted by the app for light and dark mode. The clickable parts are outlines traced over it in `src/ui/car.rs`, in the picture's own pixel coordinates.
 
-The Windows installer is built from `installer/simq.iss` with Inno Setup by the release workflow.
+The tag must match the version in `Cargo.toml`, or the release fails. Windows gets the bare program, macOS a disk image with one program for Apple Silicon and Intel, and Linux a `.deb` (from `[package.metadata.deb]` in `Cargo.toml`) and an AppImage.
 
 The look is set in `src/theme.rs`: racing red on carbon grey, slanted primary buttons and the [Titillium Web](https://fonts.google.com/specimen/Titillium+Web) typeface (SIL Open Font License, see `assets/fonts/OFL.txt`). The button icons are drawn by `tools/make_icons.py`.
 
@@ -242,10 +250,10 @@ Keep the app's source code in a different repository from the team's data, and n
 - Every change is a new file: `ops/YYYY-MM/<time>-<counter>_<client>_<id>.json`. No files are overwritten, so the content can never conflict.
 - Departments, parts and comments are events in the same log. Setting a department or a part replaces its content, so the latest event in the order wins; deleting one is final.
 - Every app replays all events in a fixed order (hybrid logical clock, then client ID and event ID) and builds its own local SQLite cache. The same files always give the same result.
-- With GitHub the app works against a local copy of `ops/`, and a background thread keeps the copy and the repository equal through the GitHub REST API: new files in the repository are downloaded, new local files are uploaded as one commit each. The team key is stored in plain text in the app's settings file on the computer.
+- With GitHub the app works against a local copy of `ops/`, and a background thread keeps the copy and the repository equal through the GitHub REST API: new files in the repository are downloaded, new local files are uploaded as one commit each. The team key is stored in the Keychain (macOS) or the Credential Manager (Windows); on Linux, or if that fails, in plain text in the app's settings file.
 - Everything coming from outside is treated as untrusted input: files over 64 KiB, broken JSON, unknown fields and files with the wrong name or path are ignored. Only `http://` and `https://` links can be clicked.
 
-The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `blobs` (uploaded files), `export` (CSV and statistics), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update) and `ui` (with `ui/overview` and `ui/car` for the car and `ui/stats`).
+The code is in `src/`: `model` (types), `hlc` (clock), `ops` (file format), `replay` (state machine), `store` (cache), `sync` (folder reading and background thread), `github` (sync with a repository), `blobs` (uploaded files), `export` (CSV and statistics), `config`, `i18n` (Swedish/English), `theme` (look and feel), `update` (in-app update), `news` ("new in this version") and `ui` (with `ui/queue`, `ui/forms`, `ui/settings`, `ui/overview` and `ui/car` for the car, and `ui/stats`).
 
 ## Licence
 
