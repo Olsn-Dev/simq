@@ -804,7 +804,7 @@ impl App {
         }
         apply_theme(&app.ctx, app.config.theme);
         // Look for a newer version once at start-up (not from the tests: it
-        // uses the network). A copy from the Microsoft Store is updated by the Store.
+        // uses the network). A .deb package is updated by installing a new one.
         if !cfg!(test) && update::install_kind() == update::Install::Portable {
             app.check_for_update(false);
         }
@@ -908,25 +908,6 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         ui.label(RichText::new("Version").strong());
-        if update::install_kind() == update::Install::Store {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("SimQ {}", update::current_version()));
-                ui.weak(t(
-                    "Microsoft Store sköter uppdateringarna.",
-                    "The Microsoft Store takes care of updates.",
-                ));
-                if let Some(page) = update::store_page() {
-                    if ui
-                        .button(t("Öppna i Microsoft Store", "Open in the Microsoft Store"))
-                        .clicked()
-                    {
-                        // A fixed address built from the product id, never from shared data.
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(page));
-                    }
-                }
-            });
-            return;
-        }
         if update::install_kind() == update::Install::LinuxPackage {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("SimQ {}", update::current_version()));

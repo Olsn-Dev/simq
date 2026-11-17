@@ -29,8 +29,6 @@ pub fn current_version() -> &'static str {
 /// How this copy of the app was installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Install {
-    /// From the Microsoft Store (an MSIX package). The Store updates it.
-    Store,
     /// From the Linux package (.deb), in a system folder the app may not
     /// write to. A new package is installed instead.
     LinuxPackage,
@@ -38,12 +36,8 @@ pub enum Install {
     Portable,
 }
 
-/// Whether this copy runs inside an MSIX package from the Microsoft Store.
+/// Whether the app may replace itself, or a package manager updates it.
 pub fn install_kind() -> Install {
-    #[cfg(windows)]
-    if runs_in_package() {
-        return Install::Store;
-    }
     if cfg!(target_os = "linux")
         && appimage().is_none()
         && current_exe().is_ok_and(|exe| exe.starts_with("/usr"))
@@ -62,34 +56,6 @@ fn appimage() -> Option<PathBuf> {
     std::env::var_os("APPIMAGE")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
-}
-
-/// Asks Windows for the name of the package the program runs in. Outside a
-/// package Windows answers APPMODEL_ERROR_NO_PACKAGE.
-#[cfg(windows)]
-fn runs_in_package() -> bool {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetCurrentPackageFullName(length: *mut u32, name: *mut u16) -> i32;
-    }
-    const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
-    let mut length = 0u32;
-    // SAFETY: with a length of 0 Windows writes nothing to the null buffer;
-    // it only reports how long the name is, or that there is no package.
-    let result = unsafe { GetCurrentPackageFullName(&mut length, std::ptr::null_mut()) };
-    result != APPMODEL_ERROR_NO_PACKAGE
-}
-
-/// The app's page in the Microsoft Store, when the release was built with
-/// its product id (from Partner Center) in `SIMQ_STORE_PRODUCT_ID`.
-pub fn store_page() -> Option<String> {
-    store_page_for(option_env!("SIMQ_STORE_PRODUCT_ID"))
-}
-
-fn store_page_for(product_id: Option<&str>) -> Option<String> {
-    let id = product_id?.trim();
-    let valid = !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_alphanumeric());
-    valid.then(|| format!("ms-windows-store://pdp/?ProductId={id}"))
 }
 
 /// Name of the release file for this platform, if automatic update is supported.
@@ -519,16 +485,8 @@ mod tests {
     }
 
     #[test]
-    fn the_store_page_needs_a_plain_product_id() {
-        assert_eq!(
-            store_page_for(Some("9NBLGGH4R32N")).as_deref(),
-            Some("ms-windows-store://pdp/?ProductId=9NBLGGH4R32N")
-        );
-        assert_eq!(store_page_for(None), None);
-        assert_eq!(store_page_for(Some("")), None);
-        assert_eq!(store_page_for(Some("9N&x=javascript")), None);
-        // Outside Windows the app is never a Store copy.
-        if !cfg!(windows) {
+    fn outside_a_linux_package_the_app_updates_itself() {
+        if !cfg!(target_os = "linux") {
             assert_eq!(install_kind(), Install::Portable);
         }
     }
