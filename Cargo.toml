@@ -27,6 +27,7 @@ thiserror = "1"
 anyhow = "1"
 ureq = "2"
 sha2 = "0.10"
+sys-locale = "0.3"
 
 # Gives the Windows program its icon.
 [target.'cfg(windows)'.build-dependencies]

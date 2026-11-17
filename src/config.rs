@@ -59,7 +59,9 @@ impl Config {
             sync_folder: None,
             github: None,
             display_name: String::new(),
-            language: Lang::default(),
+            // Settings from before this choice existed keep Swedish (the
+            // serde default); a new installation follows the computer.
+            language: Lang::of_computer(),
             theme: ThemeChoice::default(),
             client_id: Uuid::new_v4(),
             last_seen_version: None,
@@ -270,7 +272,7 @@ mod tests {
         let again = load_or_init(&paths).unwrap();
         assert_eq!(again, config);
         assert!(again.is_complete());
-        assert_eq!(again.language, Lang::Sv);
+        assert_eq!(again.language, Lang::of_computer());
     }
 
     #[test]
