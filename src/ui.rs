@@ -78,6 +78,8 @@ struct Filters {
     person: Option<String>,
     mine: bool,
     unread: bool,
+    /// Active requests with a deadline that has passed or is close.
+    due_soon: bool,
 }
 
 impl Filters {
@@ -93,6 +95,7 @@ impl Filters {
             && self.person.as_ref().is_none_or(|p| is(p))
             && (!self.mine || is(me))
             && (!self.unread || unread.contains(&r.request_id))
+            && (!self.due_soon || is_due_soon(r, Local::now().date_naive()))
     }
 }
 
@@ -266,10 +269,35 @@ enum Tab {
     Failed,
     Cancelled,
     All,
+    /// Finished requests that ended more than `ARCHIVE_DAYS` ago.
+    Archive,
+}
+
+/// Finished requests move to the archive this many days after they ended,
+/// so that the other tabs stay short. Nothing is deleted.
+const ARCHIVE_DAYS: u64 = 30;
+
+/// True for a request that has been finished for more than `ARCHIVE_DAYS`.
+fn is_archived(r: &Request, now_ms: u64) -> bool {
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    !r.status.is_active()
+        && r.finished_at
+            .is_some_and(|at| now_ms.saturating_sub(at) > ARCHIVE_DAYS * DAY)
+}
+
+/// Days ahead that a deadline counts as close.
+const DUE_SOON_DAYS: i64 = 3;
+
+/// An active request whose deadline has passed or is at most
+/// `DUE_SOON_DAYS` away.
+fn is_due_soon(r: &Request, today: NaiveDate) -> bool {
+    r.status.is_active()
+        && NaiveDate::parse_from_str(&r.deadline, "%Y-%m-%d")
+            .is_ok_and(|deadline| (deadline - today).num_days() <= DUE_SOON_DAYS)
 }
 
 impl Tab {
-    const ALL: [Tab; 7] = [
+    const ALL: [Tab; 8] = [
         Tab::Active,
         Tab::Queued,
         Tab::Running,
@@ -277,6 +305,7 @@ impl Tab {
         Tab::Failed,
         Tab::Cancelled,
         Tab::All,
+        Tab::Archive,
     ];
 
     fn label(self) -> &'static str {
@@ -288,10 +317,16 @@ impl Tab {
             Tab::Failed => t("Misslyckade", "Failed"),
             Tab::Cancelled => t("Avbrutna", "Cancelled"),
             Tab::All => t("Alla", "All"),
+            Tab::Archive => t("Arkiv", "Archive"),
         }
     }
 
-    fn matches(self, status: Status) -> bool {
+    /// Archived requests only show in the archive, and in "All" while searching.
+    fn matches(self, r: &Request, now_ms: u64, searching: bool) -> bool {
+        let status = r.status;
+        if is_archived(r, now_ms) {
+            return self == Tab::Archive || (self == Tab::All && searching);
+        }
         match self {
             Tab::Active => status.is_active(),
             Tab::Queued => status == Status::Queued,
@@ -300,6 +335,7 @@ impl Tab {
             Tab::Failed => status == Status::Failed,
             Tab::Cancelled => status == Status::Cancelled,
             Tab::All => true,
+            Tab::Archive => false,
         }
     }
 }
@@ -964,11 +1000,12 @@ impl App {
     /// The requests that pass the search and the filters, and the tab if one is given.
     fn filtered<'a>(&self, snapshot: &'a Snapshot, tab: Option<Tab>) -> Vec<&'a Request> {
         let needle = self.search.trim().to_lowercase();
+        let now = crate::sync::now_ms();
         snapshot
             .requests
             .iter()
             .filter(|r| {
-                tab.is_none_or(|tab| tab.matches(r.status))
+                tab.is_none_or(|tab| tab.matches(r, now, !needle.is_empty()))
                     && matches_search(r, &needle, snapshot)
                     && self
                         .filters
@@ -1673,9 +1710,14 @@ impl App {
                 }
                 ui.add_space(6.0);
                 let base = self.filtered(&snapshot, None);
+                let now = crate::sync::now_ms();
+                let searching = !self.search.trim().is_empty();
                 ui.horizontal_wrapped(|ui| {
                     for tab in Tab::ALL {
-                        let count = base.iter().filter(|r| tab.matches(r.status)).count();
+                        let count = base
+                            .iter()
+                            .filter(|r| tab.matches(r, now, searching))
+                            .count();
                         ui.selectable_value(
                             &mut self.tab,
                             tab,
@@ -1685,7 +1727,64 @@ impl App {
                 });
                 ui.add_space(2.0);
                 self.filter_ui(ui, &snapshot);
+                self.deadline_reminder_ui(ui, &snapshot);
             });
+    }
+
+    /// A line that points out requests whose deadline has passed or is close.
+    fn deadline_reminder_ui(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        if self.filters.due_soon {
+            return;
+        }
+        let today = Local::now().date_naive();
+        let me = &self.config.display_name;
+        let due: Vec<&Request> = snapshot
+            .requests
+            .iter()
+            .filter(|r| is_due_soon(r, today))
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let overdue = due.iter().filter(|r| is_overdue(r, today)).count();
+        let mine = due
+            .iter()
+            .filter(|r| r.requester == *me || r.assignee == *me)
+            .count();
+        let text = match (is_en(), overdue) {
+            (true, 0) => format!(
+                "{} request(s) have a deadline within {DUE_SOON_DAYS} days",
+                due.len()
+            ),
+            (true, _) => format!(
+                "{} request(s) have a deadline within {DUE_SOON_DAYS} days, {overdue} of them overdue",
+                due.len()
+            ),
+            (false, 0) => format!(
+                "{} förfrågan/förfrågningar har deadline inom {DUE_SOON_DAYS} dagar",
+                due.len()
+            ),
+            (false, _) => format!(
+                "{} förfrågan/förfrågningar har deadline inom {DUE_SOON_DAYS} dagar, varav {overdue} försenade",
+                due.len()
+            ),
+        };
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            theme::dot(ui, ui.visuals().warn_fg_color);
+            ui.label(text);
+            if mine > 0 {
+                ui.weak(if is_en() {
+                    format!("({mine} yours)")
+                } else {
+                    format!("({mine} dina)")
+                });
+            }
+            if ui.small_button(t("Visa dem", "Show them")).clicked() {
+                self.filters.due_soon = true;
+                self.tab = Tab::Active;
+            }
+        });
     }
 
     /// Opens the form for a new request, optionally filled in for a department and a part.
@@ -1815,6 +1914,12 @@ impl App {
                     "Dina ärenden som någon annan har ändrat sedan du senast öppnade dem",
                     "Your requests that someone else has changed since you last opened them",
                 ));
+            ui.toggle_value(&mut self.filters.due_soon, t("Snart deadline", "Due soon"))
+                .on_hover_text(if is_en() {
+                    format!("Active requests whose deadline has passed or is at most {DUE_SOON_DAYS} days away")
+                } else {
+                    format!("Aktiva ärenden vars deadline har passerat eller är högst {DUE_SOON_DAYS} dagar bort")
+                });
             if self.filters.any()
                 && ui
                     .small_button(t("Rensa filter", "Clear filters"))
@@ -2971,7 +3076,12 @@ impl App {
                 }
                 UiAction::GoToRequest(id) => {
                     self.view = View::Queue;
-                    self.tab = Tab::All;
+                    let archived = self
+                        .snapshot
+                        .requests
+                        .iter()
+                        .any(|r| r.request_id == id && is_archived(r, crate::sync::now_ms()));
+                    self.tab = if archived { Tab::Archive } else { Tab::All };
                     self.filters = Filters::default();
                     self.search.clear();
                     self.comment_draft.clear();
@@ -3992,6 +4102,56 @@ mod tests {
         app.settings_open = true;
         app.settings_tab = SettingsTab::Diagnostics;
         frame(&ctx, &mut app);
+    }
+
+    #[test]
+    fn old_finished_requests_move_to_the_archive() {
+        const DAY: u64 = 24 * 60 * 60 * 1000;
+        let now = 1_800_000_000_000;
+        let shared = TempDir::new();
+        let local = TempDir::new();
+        let ctx = egui::Context::default();
+        let (app, _, _) = app_with_data(&shared, &local, &ctx);
+        let mut r = app.snapshot.requests[0].clone();
+        r.status = Status::Done;
+        r.finished_at = Some(now - 31 * DAY);
+        assert!(is_archived(&r, now));
+        assert!(Tab::Archive.matches(&r, now, false));
+        assert!(!Tab::All.matches(&r, now, false));
+        assert!(!Tab::Done.matches(&r, now, false));
+        assert!(Tab::All.matches(&r, now, true), "found when searching");
+        r.finished_at = Some(now - 29 * DAY);
+        assert!(!is_archived(&r, now));
+        assert!(Tab::Done.matches(&r, now, false));
+        assert!(!Tab::Archive.matches(&r, now, false));
+        // An active request is never archived.
+        r.status = Status::Queued;
+        r.finished_at = Some(now - 90 * DAY);
+        assert!(!is_archived(&r, now));
+    }
+
+    #[test]
+    fn deadlines_close_by_are_pointed_out() {
+        let shared = TempDir::new();
+        let local = TempDir::new();
+        let ctx = egui::Context::default();
+        let (app, _, _) = app_with_data(&shared, &local, &ctx);
+        let today = NaiveDate::from_ymd_opt(2026, 11, 17).unwrap();
+        let mut r = app.snapshot.requests[0].clone();
+        r.status = Status::Queued;
+        for (deadline, due) in [
+            ("", false),
+            ("2026-11-10", true),
+            ("2026-11-17", true),
+            ("2026-11-20", true),
+            ("2026-11-21", false),
+        ] {
+            r.deadline = deadline.to_string();
+            assert_eq!(is_due_soon(&r, today), due, "{deadline}");
+        }
+        r.deadline = "2026-11-10".to_string();
+        r.status = Status::Done;
+        assert!(!is_due_soon(&r, today));
     }
 
     #[test]
