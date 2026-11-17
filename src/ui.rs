@@ -1265,6 +1265,9 @@ impl App {
         if focused && !self.was_focused {
             self.handle.send(Cmd::FocusSync);
         }
+        if focused != self.was_focused {
+            self.handle.send(Cmd::Background(!focused));
+        }
         self.was_focused = focused;
 
         if let Some(rx) = &self.picker {
@@ -3187,6 +3190,41 @@ fn remote_status_ui(ui: &mut egui::Ui, remote: &RemoteStatus) {
             format!("· {} ändring(ar) väntar på att skickas", remote.pending)
         });
     }
+    if let Some(warning) = remote
+        .token_expires_ms
+        .and_then(|at| token_warning(at, crate::sync::now_ms()))
+    {
+        ui.separator();
+        ui.colored_label(ui.visuals().warn_fg_color, warning)
+            .on_hover_text(t(
+                "Den som skapade teamnyckeln på GitHub kan förlänga den eller skapa en ny. En ny nyckel klistras in under Inställningar.",
+                "Whoever created the team key on GitHub can extend it or create a new one. A new key is pasted under Settings.",
+            ));
+    }
+}
+
+/// Days before the team key expires that the warning starts showing.
+const TOKEN_WARNING_DAYS: u64 = 14;
+
+/// A warning when the team key expires within two weeks.
+fn token_warning(expires_ms: u64, now_ms: u64) -> Option<String> {
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    if expires_ms > now_ms + TOKEN_WARNING_DAYS * DAY {
+        return None;
+    }
+    if expires_ms <= now_ms {
+        return Some(t("Teamnyckeln har gått ut", "The team key has expired").to_string());
+    }
+    let days = (expires_ms - now_ms).div_ceil(DAY);
+    let date = local_time(expires_ms)
+        .map(|at| at.format("%Y-%m-%d").to_string())
+        .unwrap_or_default();
+    Some(match (is_en(), days) {
+        (true, 1) => format!("The team key expires within a day ({date})"),
+        (true, _) => format!("The team key expires in {days} days ({date})"),
+        (false, 1) => format!("Teamnyckeln går ut inom ett dygn ({date})"),
+        (false, _) => format!("Teamnyckeln går ut om {days} dagar ({date})"),
+    })
 }
 
 /// Looks for `simq-teamkey.txt` next to the app (or next to the .app bundle on macOS).
@@ -3954,6 +3992,25 @@ mod tests {
         app.settings_open = true;
         app.settings_tab = SettingsTab::Diagnostics;
         frame(&ctx, &mut app);
+    }
+
+    #[test]
+    fn the_team_key_warning_starts_two_weeks_before() {
+        const DAY: u64 = 24 * 60 * 60 * 1000;
+        let now = 1_800_000_000_000;
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            assert_eq!(token_warning(now + 15 * DAY, now), None);
+            assert!(token_warning(now + 14 * DAY, now)
+                .unwrap()
+                .contains("in 14 days"));
+            assert!(token_warning(now + DAY / 2, now)
+                .unwrap()
+                .contains("within a day"));
+            assert_eq!(
+                token_warning(now, now).as_deref(),
+                Some("The team key has expired")
+            );
+        });
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -810,6 +811,8 @@ pub enum Cmd {
     SyncNow,
     /// The window got focus (skipped if we just synced).
     FocusSync,
+    /// The window went to the background (true) or came back (false).
+    Background(bool),
     Submit {
         token: u64,
         request_id: Option<Uuid>,
@@ -919,6 +922,7 @@ pub fn spawn(
         shared: Arc::clone(&shared),
         notify,
         last_sync: None,
+        background: Arc::new(AtomicBool::new(false)),
     };
     worker.start_transport();
     *shared.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(worker.client.snapshot());
@@ -939,6 +943,8 @@ struct Worker {
     shared: Arc<Mutex<Arc<Snapshot>>>,
     notify: Arc<dyn Fn() + Send + Sync>,
     last_sync: Option<Instant>,
+    /// Shared with the GitHub thread, which asks less often while it is true.
+    background: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -969,8 +975,12 @@ impl Worker {
                         .last_sync
                         .is_none_or(|at| at.elapsed() >= FOCUS_SYNC_MIN_GAP)
                     {
+                        self.wake_transport();
                         self.sync();
                     }
+                }
+                Ok(Cmd::Background(background)) => {
+                    self.background.store(background, Ordering::Relaxed);
                 }
                 Ok(Cmd::Submit {
                     token,
@@ -1087,6 +1097,7 @@ impl Worker {
             Box::new(GithubRemote::new(&github)),
             github.repo.clone(),
             folder,
+            Arc::clone(&self.background),
             Box::new(move |status, new_files| {
                 let _ = tx.send(Cmd::Remote { status, new_files });
             }),
