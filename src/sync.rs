@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -518,6 +519,7 @@ impl Client {
                 (NewAction::Create { input, .. }, FileSlot::Input) => *input = location,
                 (NewAction::Finish { report, .. }, FileSlot::Report) => *report = location,
                 (NewAction::Finish { results, .. }, FileSlot::Results) => *results = location,
+                (NewAction::Attach { location: slot }, FileSlot::Attachment) => *slot = location,
                 _ => {
                     return Err(t(
                         "Filen passar inte till den här åtgärden.",
@@ -675,6 +677,15 @@ impl Client {
                     truncate_chars(&one_line(&p.name), 60),
                     p.status.label()
                 ),
+                (ops::Action::Attach { location }, Some(kind)) => {
+                    let name = match location.kind {
+                        LocKind::File => blobs::FileRef::parse(&location.value)
+                            .map(|f| f.name)
+                            .unwrap_or_default(),
+                        _ => location.value.clone(),
+                    };
+                    format!("{}: {}", kind.label(), truncate_chars(&one_line(&name), 60))
+                }
                 (_, Some(kind)) => kind.label().to_string(),
                 (_, None) => format!(
                     "{} ({})",
@@ -768,6 +779,7 @@ fn orphan_files(state: &State) -> Vec<blobs::FileRef> {
         [&r.input, &r.report, &r.results]
             .into_iter()
             .flatten()
+            .chain(r.attachments.iter().map(|a| &a.location))
             .filter(|l| l.kind == LocKind::File)
             .filter_map(|l| blobs::FileRef::parse(&l.value))
             .collect::<Vec<_>>()
@@ -810,6 +822,8 @@ pub enum Cmd {
     SyncNow,
     /// The window got focus (skipped if we just synced).
     FocusSync,
+    /// The window went to the background (true) or came back (false).
+    Background(bool),
     Submit {
         token: u64,
         request_id: Option<Uuid>,
@@ -851,6 +865,8 @@ pub enum FileSlot {
     Input,
     Report,
     Results,
+    /// An extra file on a request.
+    Attachment,
 }
 
 /// Where the events should be synced.
@@ -919,6 +935,7 @@ pub fn spawn(
         shared: Arc::clone(&shared),
         notify,
         last_sync: None,
+        background: Arc::new(AtomicBool::new(false)),
     };
     worker.start_transport();
     *shared.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(worker.client.snapshot());
@@ -939,6 +956,8 @@ struct Worker {
     shared: Arc<Mutex<Arc<Snapshot>>>,
     notify: Arc<dyn Fn() + Send + Sync>,
     last_sync: Option<Instant>,
+    /// Shared with the GitHub thread, which asks less often while it is true.
+    background: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -969,8 +988,12 @@ impl Worker {
                         .last_sync
                         .is_none_or(|at| at.elapsed() >= FOCUS_SYNC_MIN_GAP)
                     {
+                        self.wake_transport();
                         self.sync();
                     }
+                }
+                Ok(Cmd::Background(background)) => {
+                    self.background.store(background, Ordering::Relaxed);
                 }
                 Ok(Cmd::Submit {
                     token,
@@ -1087,6 +1110,7 @@ impl Worker {
             Box::new(GithubRemote::new(&github)),
             github.repo.clone(),
             folder,
+            Arc::clone(&self.background),
             Box::new(move |status, new_files| {
                 let _ = tx.send(Cmd::Remote { status, new_files });
             }),
@@ -1910,6 +1934,61 @@ mod tests {
             fs::read_dir(shared.path().join(OPS_DIR)).unwrap().count(),
             1
         );
+    }
+
+    #[test]
+    fn extra_files_are_added_uploaded_and_cleaned() {
+        let shared = TempDir::new();
+        let source = TempDir::new();
+        let mut a = client(shared.path(), "Anna");
+        let mut b = client(shared.path(), "Bo");
+        let id = applied(a.submit(None, &create_action("Upright")));
+        let cad = source.path().join("upright.step");
+        std::fs::write(&cad, b"solid upright").unwrap();
+        let attach = || NewAction::Attach { location: None };
+        applied(a.submit_with_files(
+            Some(id),
+            attach(),
+            vec![(FileSlot::Attachment, cad.clone())],
+        ));
+        let link = NewAction::Attach {
+            location: Some(Location {
+                kind: LocKind::Drive,
+                value: "https://drive.google.com/lastfall".to_string(),
+            }),
+        };
+        applied(a.submit(Some(id), &link));
+
+        // Another app sees both, in order, and the history names the file.
+        b.sync();
+        let snapshot = b.snapshot();
+        let request = snapshot
+            .requests
+            .iter()
+            .find(|r| r.request_id == id)
+            .unwrap();
+        assert_eq!(request.attachments.len(), 2);
+        let file = blobs::FileRef::parse(&request.attachments[0].location.value).unwrap();
+        assert_eq!(file.name, "upright.step");
+        assert_eq!(request.attachments[1].location.kind, LocKind::Drive);
+        assert_eq!(request.attachments[0].by, "Anna");
+        assert!(snapshot.history[&id]
+            .iter()
+            .any(|h| h.what.ends_with("upright.step")));
+        // Adding a file is not a change of status.
+        assert_eq!(request.status, Status::Queued);
+        assert_eq!(request.last_kind, crate::model::OpKind::Create);
+
+        // A file that only a deleted request has is offered for cleaning.
+        applied(b.submit(
+            Some(id),
+            &NewAction::Delete {
+                note: String::new(),
+            },
+        ));
+        let orphans = b.snapshot().orphan_files;
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].name, "upright.step");
     }
 
     #[test]

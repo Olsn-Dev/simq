@@ -1,6 +1,6 @@
 [package]
 name = "simq"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 description = "SimQ – a queue and tracker for simulation requests in a Formula Student team"
 license = "MIT"
@@ -27,10 +27,30 @@ thiserror = "1"
 anyhow = "1"
 ureq = "2"
 sha2 = "0.10"
+sys-locale = "0.3"
+
+# The team key is kept in the Keychain on macOS and the Credential Manager on
+# Windows. On Linux it stays in the settings file.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
 # Gives the Windows program its icon.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# The Linux package, built by `cargo deb` in the release workflow.
+[package.metadata.deb]
+name = "simq"
+maintainer = "SimQ <https://github.com/Olsn-Dev/simq>"
+section = "utils"
+priority = "optional"
+extended-description = "A small desktop app for Formula Student teams that keeps track of which simulations are needed, who is doing them, and where the input, report and results are. Syncs through a private GitHub repository or a shared folder."
+assets = [
+    ["target/release/simq", "usr/bin/", "755"],
+    ["assets/linux/simq.desktop", "usr/share/applications/", "644"],
+    ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/simq.png", "644"],
+    ["README.md", "usr/share/doc/simq/README.md", "644"],
+]
 
 [profile.release]
 opt-level = 3

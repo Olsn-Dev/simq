@@ -25,6 +25,10 @@ use crate::ops::{self, FORMAT_FILE, FORMAT_VERSION, MAX_FILE_BYTES, OPS_DIR};
 const API_BASE: &str = "https://api.github.com";
 /// How often we ask GitHub whether there is anything new.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// The same while the window is in the background, which is kinder to the
+/// rate limit when many on the team keep the app open. Getting focus back
+/// starts a round at once.
+pub const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_secs(90);
 const UPLOAD_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +155,26 @@ pub trait RemoteStore: Send {
     ) -> Result<(), RemoteError>;
     /// Removes a user file. True if there was one to remove.
     fn delete_file(&mut self, sha256: &str) -> Result<bool, RemoteError>;
+    /// When the key stops working (ms since 1970), if the store has said so.
+    fn token_expires_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Reads GitHub's `GitHub-Authentication-Token-Expiration` header, e.g.
+/// `2026-12-01 10:00:00 UTC` or `2026-12-01 10:00:00 +0100`, as ms since 1970.
+pub fn parse_token_expiry(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let at = if let Some(utc) = value.strip_suffix("UTC") {
+        chrono::NaiveDateTime::parse_from_str(utc.trim(), "%Y-%m-%d %H:%M:%S")
+            .ok()?
+            .and_utc()
+    } else {
+        chrono::DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S %z")
+            .ok()?
+            .to_utc()
+    };
+    u64::try_from(at.timestamp_millis()).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +189,8 @@ pub struct GithubRemote {
     repo: String,
     token: String,
     branch: String,
+    /// From the latest answer that said when the key expires.
+    token_expires_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +320,7 @@ impl GithubRemote {
             repo: config.repo.clone(),
             token: config.token.clone(),
             branch: config.branch.clone(),
+            token_expires_ms: None,
         }
     }
 
@@ -429,6 +456,10 @@ impl GithubRemote {
 }
 
 impl RemoteStore for GithubRemote {
+    fn token_expires_ms(&self) -> Option<u64> {
+        self.token_expires_ms
+    }
+
     fn upload_file(&mut self, sha256: &str, path: &Path) -> Result<(), RemoteError> {
         if !blobs::valid_sha256(sha256) {
             return Err(RemoteError::Other(
@@ -571,6 +602,12 @@ impl RemoteStore for GithubRemote {
             }
             Err(e) => return Err(classify(e)),
         };
+        if let Some(at) = response
+            .header("github-authentication-token-expiration")
+            .and_then(parse_token_expiry)
+        {
+            self.token_expires_ms = Some(at);
+        }
         if response.status() == 304 {
             return Ok(Listing::Unchanged);
         }
@@ -881,6 +918,8 @@ pub struct RemoteStatus {
     /// Uploaded files waiting to be sent.
     pub pending_files: usize,
     pub last_ok_ms: Option<u64>,
+    /// When the team key expires, if GitHub has said.
+    pub token_expires_ms: Option<u64>,
 }
 
 impl RemoteStatus {
@@ -891,6 +930,7 @@ impl RemoteStatus {
             pending: 0,
             pending_files: 0,
             last_ok_ms: None,
+            token_expires_ms: None,
         }
     }
 }
@@ -917,10 +957,12 @@ impl Drop for Transport {
 
 /// Starts the thread that mirrors `folder` against `remote`. `report` is called
 /// after every round with the status and whether new files were downloaded.
+/// While `background` is true the rounds are further apart.
 pub fn spawn_transport(
     mut remote: Box<dyn RemoteStore>,
     repo: String,
     folder: PathBuf,
+    background: Arc<AtomicBool>,
     report: Box<dyn Fn(RemoteStatus, bool) + Send>,
 ) -> std::io::Result<Transport> {
     let (wake, wake_rx) = mpsc::channel();
@@ -951,10 +993,16 @@ pub fn spawn_transport(
                         pending: round.pending,
                         pending_files: round.pending_files,
                         last_ok_ms,
+                        token_expires_ms: remote.token_expires_ms(),
                     },
                     round.downloaded > 0,
                 );
-                match wake_rx.recv_timeout(POLL_INTERVAL) {
+                let interval = if background.load(Ordering::Relaxed) {
+                    BACKGROUND_POLL_INTERVAL
+                } else {
+                    POLL_INTERVAL
+                };
+                match wake_rx.recv_timeout(interval) {
                     Ok(()) | Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -1706,7 +1754,14 @@ mod tests {
                 "{{\"sha\":\"x\",\"tree\":[{}],\"truncated\":false}}",
                 entries.join(",")
             );
-            return respond(stream, 200, &format!("ETag: {etag}\r\n"), body.as_bytes());
+            return respond(
+                stream,
+                200,
+                &format!(
+                    "ETag: {etag}\r\nGitHub-Authentication-Token-Expiration: 2026-12-01 10:00:00 UTC\r\n"
+                ),
+                body.as_bytes(),
+            );
         }
         if let Some(path) = rest.strip_prefix("/contents/") {
             if method == "GET" {
@@ -1932,6 +1987,20 @@ mod tests {
     }
 
     #[test]
+    fn token_expiry_header() {
+        assert_eq!(
+            parse_token_expiry("2026-12-01 10:00:00 UTC"),
+            Some(1_796_119_200_000)
+        );
+        assert_eq!(
+            parse_token_expiry("2026-12-01 11:00:00 +0100"),
+            Some(1_796_119_200_000)
+        );
+        assert_eq!(parse_token_expiry("snart"), None);
+        assert_eq!(parse_token_expiry(""), None);
+    }
+
+    #[test]
     fn whole_flow_over_http_with_transport_thread() {
         let (base, server) = start_server();
         server.lock().unwrap().empty = true;
@@ -1946,6 +2015,7 @@ mod tests {
                 Box::new(remote_at(&base, TOKEN)),
                 "lag/simq".to_string(),
                 dir.path().to_path_buf(),
+                Arc::new(AtomicBool::new(false)),
                 Box::new(move |status, new_files| {
                     let _ = tx.send((status, new_files));
                 }),
@@ -1966,6 +2036,10 @@ mod tests {
         let transport_b = spawn(&b.dir, tx_b);
         let (status, new_files) = rx_b.recv_timeout(Duration::from_secs(20)).unwrap();
         assert_eq!((status.state, new_files), (RemoteState::Ok, true));
+        assert_eq!(
+            status.token_expires_ms,
+            parse_token_expiry("2026-12-01 10:00:00 UTC")
+        );
         b.client.sync();
         assert_eq!(b.client.state().requests[&id].title, "Upright");
 

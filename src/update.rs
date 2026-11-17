@@ -26,14 +26,52 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// How this copy of the app was installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Install {
+    /// From the Linux package (.deb), in a system folder the app may not
+    /// write to. A new package is installed instead.
+    LinuxPackage,
+    /// Any other way. The app updates itself from GitHub Releases.
+    Portable,
+}
+
+/// Whether the app may replace itself, or a package manager updates it.
+pub fn install_kind() -> Install {
+    if cfg!(target_os = "linux")
+        && appimage().is_none()
+        && current_exe().is_ok_and(|exe| exe.starts_with("/usr"))
+    {
+        return Install::LinuxPackage;
+    }
+    Install::Portable
+}
+
+/// The AppImage file the app was started from, if any. The program itself
+/// then lies in a read-only folder, so an update replaces the AppImage.
+fn appimage() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+}
+
 /// Name of the release file for this platform, if automatic update is supported.
 pub fn asset_name() -> Option<&'static str> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some("simq-macos-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("simq-macos-x64")
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         Some("simq-windows-x64.exe")
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Some("simq-linux-x64")
+        Some(if appimage().is_some() {
+            "simq-linux-x64.AppImage"
+        } else {
+            "simq-linux-x64"
+        })
     } else {
         None
     }
@@ -326,10 +364,7 @@ fn resign_bundle(exe: &Path) {
     if !cfg!(target_os = "macos") {
         return;
     }
-    let bundle = exe.ancestors().find(|dir| {
-        dir.extension().is_some_and(|ext| ext == "app") && dir.join("Contents").is_dir()
-    });
-    if let Some(bundle) = bundle {
+    if let Some(bundle) = bundle_of(exe) {
         let _ = std::process::Command::new("/usr/bin/codesign")
             .args(["--force", "--deep", "--sign", "-"])
             .arg(bundle)
@@ -345,24 +380,79 @@ fn current_exe() -> Result<PathBuf, String> {
 /// Downloads and installs `available`. Returns the installed version.
 pub fn download_and_install(available: &Available, token: Option<&str>) -> Result<String, String> {
     let bytes = download(available, token)?;
-    install_at(&current_exe()?, &bytes)?;
+    let target = match appimage() {
+        Some(file) => file,
+        None => current_exe()?,
+    };
+    install_at(&target, &bytes)?;
     Ok(available.version.clone())
 }
 
 /// Starts the (new) program with the same arguments. The caller then closes this one.
 pub fn restart() -> Result<(), String> {
-    std::process::Command::new(current_exe()?)
+    let program = match appimage() {
+        Some(file) => file,
+        None => current_exe()?,
+    };
+    std::process::Command::new(program)
         .args(std::env::args_os().skip(1))
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
-/// Removes the previous version left behind by an update on Windows.
+/// Removes the previous version left behind by an update on Windows, and on
+/// macOS brings the app bundle's icon up to date.
 pub fn clean_up_after_update() {
     if let Ok(exe) = current_exe() {
         let _ = std::fs::remove_file(old_path(&exe));
+        #[cfg(target_os = "macos")]
+        refresh_bundle_icon(&exe, BUNDLE_ICON);
     }
+}
+
+/// The icon file of the app bundle, built into the program. The in-app update
+/// only replaces the program, so the new version writes its own icon into the
+/// bundle on its first start. Otherwise the Dock and Finder keep showing the
+/// icon of the version that was first installed.
+#[cfg(target_os = "macos")]
+const BUNDLE_ICON: &[u8] = include_bytes!("../assets/SimQ.icns");
+
+/// The `.app` folder the program at `exe` lies in, if any.
+fn bundle_of(exe: &Path) -> Option<&Path> {
+    exe.ancestors().find(|dir| {
+        dir.extension().is_some_and(|ext| ext == "app") && dir.join("Contents").is_dir()
+    })
+}
+
+/// Writes `icon` as the bundle's icon file if it differs from the one there.
+/// Returns true if the file was replaced. Outside a bundle nothing happens.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn refresh_bundle_icon(exe: &Path, icon: &[u8]) -> bool {
+    let Some(bundle) = bundle_of(exe) else {
+        return false;
+    };
+    let resources = bundle.join("Contents").join("Resources");
+    let file = resources.join("SimQ.icns");
+    if std::fs::read(&file).is_ok_and(|current| current == icon) {
+        return false;
+    }
+    let tmp = resources.join("SimQ.icns.new");
+    let written = std::fs::create_dir_all(&resources).is_ok()
+        && std::fs::write(&tmp, icon).is_ok()
+        && std::fs::rename(&tmp, &file).is_ok();
+    if !written {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    resign_bundle(exe);
+    // A new modification time makes Finder and the Dock read the icon again.
+    if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("/usr/bin/touch")
+            .arg(bundle)
+            .output();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -372,6 +462,34 @@ mod tests {
     use crate::testutil::TempDir;
     use std::io::Write;
     use std::net::TcpListener;
+
+    #[test]
+    fn the_bundle_icon_is_replaced_only_when_it_differs() {
+        let tmp = TempDir::new();
+        let macos = tmp.path().join("SimQ.app").join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exe = macos.join("simq");
+        std::fs::write(&exe, b"program").unwrap();
+        let icon = tmp.path().join("SimQ.app/Contents/Resources/SimQ.icns");
+        std::fs::create_dir_all(icon.parent().unwrap()).unwrap();
+        std::fs::write(&icon, b"old icon").unwrap();
+
+        assert!(refresh_bundle_icon(&exe, b"new icon"));
+        assert_eq!(std::fs::read(&icon).unwrap(), b"new icon");
+        assert!(!refresh_bundle_icon(&exe, b"new icon"));
+
+        // A program outside a bundle is left alone.
+        let loose = tmp.path().join("simq");
+        std::fs::write(&loose, b"program").unwrap();
+        assert!(!refresh_bundle_icon(&loose, b"new icon"));
+    }
+
+    #[test]
+    fn outside_a_linux_package_the_app_updates_itself() {
+        if !cfg!(target_os = "linux") {
+            assert_eq!(install_kind(), Install::Portable);
+        }
+    }
 
     #[test]
     fn versions() {

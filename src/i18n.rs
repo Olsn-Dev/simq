@@ -22,6 +22,20 @@ pub enum Lang {
 impl Lang {
     pub const ALL: [Lang; 2] = [Lang::Sv, Lang::En];
 
+    /// The language for a new installation: Swedish on a computer set to
+    /// Swedish (or when the computer does not say), otherwise English.
+    pub fn for_locale(locale: Option<&str>) -> Lang {
+        match locale {
+            Some(locale) if !locale.to_ascii_lowercase().starts_with("sv") => Lang::En,
+            _ => Lang::Sv,
+        }
+    }
+
+    /// The language of this computer, for a new installation.
+    pub fn of_computer() -> Lang {
+        Lang::for_locale(sys_locale::get_locale().as_deref())
+    }
+
     /// The language's own name, shown the same regardless of the selected language.
     pub fn name(self) -> &'static str {
         match self {
@@ -85,6 +99,16 @@ mod tests {
         assert_eq!(t("Köad", "Queued"), "Köad");
         with_lang(Lang::En, || assert_eq!(t("Köad", "Queued"), "Queued"));
         assert_eq!(t("Köad", "Queued"), "Köad");
+    }
+
+    #[test]
+    fn a_new_installation_follows_the_computer() {
+        assert_eq!(Lang::for_locale(Some("sv-SE")), Lang::Sv);
+        assert_eq!(Lang::for_locale(Some("sv_FI")), Lang::Sv);
+        assert_eq!(Lang::for_locale(Some("SV")), Lang::Sv);
+        assert_eq!(Lang::for_locale(Some("en-US")), Lang::En);
+        assert_eq!(Lang::for_locale(Some("de-DE")), Lang::En);
+        assert_eq!(Lang::for_locale(None), Lang::Sv);
     }
 
     #[test]

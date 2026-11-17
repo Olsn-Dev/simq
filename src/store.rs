@@ -6,6 +6,7 @@
 //! - `seen_files` – which files have already been read, and how it went
 //! - `requests`   – derived requests
 //! - `comments`   – derived comments on requests
+//! - `attachments` – derived extra files on requests
 //! - `departments`, `parts` – the derived car overview
 //! - `op_result`  – whether each event was applied or rejected, and why
 //! - `meta`       – which folder the cache belongs to
@@ -78,6 +79,14 @@ CREATE TABLE IF NOT EXISTS comments (
     at_ms      INTEGER NOT NULL,
     by         TEXT NOT NULL,
     text       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attachments (
+    op_id      TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    at_ms      INTEGER NOT NULL,
+    by         TEXT NOT NULL,
+    file_kind  TEXT NOT NULL,
+    file_ref   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS departments (
     id         TEXT PRIMARY KEY,
@@ -222,7 +231,8 @@ impl Store {
                 "DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS ops;
                  DROP TABLE IF EXISTS seen_files; DROP TABLE IF EXISTS requests;
                  DROP TABLE IF EXISTS op_result; DROP TABLE IF EXISTS comments;
-                 DROP TABLE IF EXISTS departments; DROP TABLE IF EXISTS parts;",
+                 DROP TABLE IF EXISTS departments; DROP TABLE IF EXISTS parts;
+                 DROP TABLE IF EXISTS attachments;",
             )?;
         }
         conn.execute_batch(SCHEMA)?;
@@ -437,7 +447,7 @@ impl Store {
             "BEGIN;
              DELETE FROM ops; DELETE FROM seen_files;
              DELETE FROM requests; DELETE FROM op_result; DELETE FROM comments;
-             DELETE FROM departments; DELETE FROM parts;
+             DELETE FROM departments; DELETE FROM parts; DELETE FROM attachments;
              COMMIT;",
         )?;
         self.ops.clear();
@@ -594,6 +604,22 @@ fn write_request(conn: &Connection, r: &Request) -> Result<(), StoreError> {
             comment.text,
         ])?;
     }
+    conn.prepare_cached("DELETE FROM attachments WHERE request_id = ?1")?
+        .execute(params![r.request_id.to_string()])?;
+    for attachment in &r.attachments {
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO attachments (op_id, request_id, at_ms, by, file_kind, file_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?
+        .execute(params![
+            attachment.op_id.to_string(),
+            r.request_id.to_string(),
+            millis(attachment.at_ms),
+            attachment.by,
+            attachment.location.kind.as_str(),
+            attachment.location.value,
+        ])?;
+    }
     Ok(())
 }
 
@@ -642,7 +668,7 @@ fn write_part(conn: &Connection, p: &Part) -> Result<(), StoreError> {
 fn write_derived_full(conn: &Connection, state: &State) -> Result<(), StoreError> {
     conn.execute_batch(
         "DELETE FROM requests; DELETE FROM op_result; DELETE FROM comments;
-         DELETE FROM departments; DELETE FROM parts;",
+         DELETE FROM departments; DELETE FROM parts; DELETE FROM attachments;",
     )?;
     for request in state.requests.values() {
         write_request(conn, request)?;
