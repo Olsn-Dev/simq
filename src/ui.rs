@@ -4108,6 +4108,7 @@ mod tests {
 
         let config = Config {
             last_seen_version: None,
+            token_in_keychain: false,
             sync_folder: Some(shared.path().to_path_buf()),
             github: None,
             display_name: "Anna".to_string(),
