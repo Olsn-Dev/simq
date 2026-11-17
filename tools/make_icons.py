@@ -149,21 +149,32 @@ def comment():
     return image
 
 
+def copy():
+    image, draw = canvas()
+    draw.rounded_rectangle(p(22, 22, 54, 54), radius=6 * SCALE, outline=WHITE, width=6 * SCALE)
+    line(draw, [(42, 13), (16, 13), (13, 16), (13, 42)], 6)
+    return image
+
+
 ICONS = {
     "plus": plus, "close": close, "more": more, "back": back, "search": search,
     "download": download, "export": export, "sun": sun, "moon": moon,
-    "gear": gear, "sync": sync, "comment": comment,
+    "gear": gear, "sync": sync, "comment": comment, "copy": copy,
 }
 
 
 def main():
+    """Draws all icons, or only those named on the command line."""
+    import sys
+    wanted = sys.argv[1:] or list(ICONS)
     OUT.mkdir(parents=True, exist_ok=True)
-    for name, draw_icon in ICONS.items():
+    for name in wanted:
+        draw_icon = ICONS[name]
         alpha = draw_icon().resize((SIZE, SIZE), Image.LANCZOS)
         icon = Image.new("RGBA", (SIZE, SIZE), (255, 255, 255, 0))
         icon.putalpha(alpha)
         icon.save(OUT / f"{name}.png", optimize=True)
-    print("wrote", ", ".join(sorted(ICONS)))
+    print("wrote", ", ".join(sorted(wanted)))
 
 
 if __name__ == "__main__":

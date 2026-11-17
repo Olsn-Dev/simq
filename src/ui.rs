@@ -1601,10 +1601,12 @@ impl App {
                             search.request_focus();
                         }
                         if !self.search.is_empty()
-                            && ui
-                                .add(self.icons.button(ui, theme::Icon::Close, "", "×").small())
-                                .on_hover_text(t("Rensa sökningen", "Clear the search"))
-                                .clicked()
+                            && theme::named(
+                                ui.add(self.icons.button(ui, theme::Icon::Close, "", "×").small()),
+                                t("Rensa sökningen", "Clear the search"),
+                            )
+                            .on_hover_text(t("Rensa sökningen", "Clear the search"))
+                            .clicked()
                         {
                             self.search.clear();
                         }
@@ -1629,8 +1631,12 @@ impl App {
                         } else {
                             (theme::Icon::Moon, "🌙")
                         };
-                        if ui
-                            .add(self.icons.button(ui, icon, "", fallback))
+                        let name = if dark {
+                            t("Byt till ljust läge", "Switch to light mode")
+                        } else {
+                            t("Byt till mörkt läge", "Switch to dark mode")
+                        };
+                        if theme::named(ui.add(self.icons.button(ui, icon, "", fallback)), name)
                             .on_hover_text(if dark {
                                 t("Byt till ljust läge", "Switch to light mode")
                             } else {
@@ -2191,10 +2197,12 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui
-                                        .add(icons.button(ui, theme::Icon::Close, "", "×"))
-                                        .on_hover_text(t("Stäng (Esc)", "Close (Esc)"))
-                                        .clicked()
+                                    if theme::named(
+                                        ui.add(icons.button(ui, theme::Icon::Close, "", "×")),
+                                        t("Stäng", "Close"),
+                                    )
+                                    .on_hover_text(t("Stäng (Esc)", "Close (Esc)"))
+                                    .clicked()
                                     {
                                         actions.push(UiAction::CloseDetail);
                                     }
@@ -2216,12 +2224,14 @@ impl App {
                                 ui.set_width(ui.available_width());
                                 location_field(
                                     ui,
+                                    &icons,
                                     t("Rapport", "Report"),
                                     request.report.as_ref(),
                                     actions,
                                 );
                                 location_field(
                                     ui,
+                                    &icons,
                                     t("Resultat", "Results"),
                                     request.results.as_ref(),
                                     actions,
@@ -2306,7 +2316,13 @@ impl App {
                         if let Some(at) = request.finished_at {
                             text_field(ui, t("Avslutad", "Finished"), &format_time(at));
                         }
-                        location_field(ui, t("Indata", "Input"), request.input.as_ref(), actions);
+                        location_field(
+                            ui,
+                            &icons,
+                            t("Indata", "Input"),
+                            request.input.as_ref(),
+                            actions,
+                        );
 
                         theme::section(ui, t("Beskrivning", "Description"));
                         if request.description.trim().is_empty() {
@@ -2519,13 +2535,17 @@ impl App {
         }
         let snapshot = Arc::clone(&self.snapshot);
         let mut open = true;
+        // Never taller than the window, so that the title bar with the close
+        // button stays on screen. The content scrolls instead.
+        let room = (ctx.screen_rect().height() - 60.0).max(160.0);
         egui::Window::new(t("Inställningar", "Settings"))
             .id(egui::Id::new("settings_window"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
             .default_width(560.0)
-            .default_height(480.0)
+            .default_height(480.0_f32.min(room))
+            .max_height(room)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -2541,18 +2561,20 @@ impl App {
                     );
                 });
                 ui.separator();
-                match self.settings_tab {
-                    SettingsTab::Settings => {
-                        if self.identity_fields(ui, t("Spara", "Save")) {
-                            self.save_identity();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| match self.settings_tab {
+                        SettingsTab::Settings => {
+                            if self.identity_fields(ui, t("Spara", "Save")) {
+                                self.save_identity();
+                            }
+                            if self.identity.folder != self.config.sync_folder {
+                                ui.weak(t("När mappen byts läses allt in på nytt från den nya mappen.", "When the folder is changed, everything is read again from the new folder."));
+                            }
+                            self.update_settings_ui(ui);
                         }
-                        if self.identity.folder != self.config.sync_folder {
-                            ui.weak(t("När mappen byts läses allt in på nytt från den nya mappen.", "When the folder is changed, everything is read again from the new folder."));
-                        }
-                        self.update_settings_ui(ui);
-                    }
-                    SettingsTab::Diagnostics => self.diagnostics_ui(ui, &snapshot),
-                }
+                        SettingsTab::Diagnostics => self.diagnostics_ui(ui, &snapshot),
+                    });
             });
         if !open {
             self.close_settings();
@@ -2676,11 +2698,9 @@ impl App {
         }
     }
 
+    /// Shown inside the scrolling settings window.
     fn diagnostics_ui(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .max_height(440.0)
-            .show(ui, |ui| {
+        ui.vertical(|ui| {
                 stacked_field(ui, t("Appversion", "App version"), env!("CARGO_PKG_VERSION"));
                 stacked_field(ui, t("Antal händelser", "Number of events"), &snapshot.op_count.to_string());
                 stacked_field(ui, t("Antal ärenden", "Number of requests"), &snapshot.requests.len().to_string());
@@ -3292,6 +3312,7 @@ fn stacked_field(ui: &mut egui::Ui, label: &str, value: &str) {
 /// Shows a location. Only http(s) values become clickable links, everything else is plain text.
 fn location_field(
     ui: &mut egui::Ui,
+    icons: &theme::Icons,
     label: &str,
     location: Option<&Location>,
     actions: &mut Vec<UiAction>,
@@ -3316,7 +3337,19 @@ fn location_field(
                                 .size(12.0)
                                 .color(ui.visuals().weak_text_color()),
                             );
-                            if ui.small_button(t("Ladda ner", "Download")).clicked() {
+                            if ui
+                                .add(
+                                    icons
+                                        .button(
+                                            ui,
+                                            theme::Icon::Download,
+                                            t("Ladda ner", "Download"),
+                                            "",
+                                        )
+                                        .small(),
+                                )
+                                .clicked()
+                            {
                                 actions.push(UiAction::Download(file));
                             }
                         });
@@ -3344,7 +3377,14 @@ fn location_field(
                             .size(12.0)
                             .color(ui.visuals().weak_text_color()),
                     );
-                    if ui.small_button(t("Kopiera", "Copy")).clicked() {
+                    if ui
+                        .add(
+                            icons
+                                .button(ui, theme::Icon::Copy, t("Kopiera", "Copy"), "")
+                                .small(),
+                        )
+                        .clicked()
+                    {
                         ui.ctx().copy_text(location.value.clone());
                     }
                 });

@@ -163,10 +163,11 @@ pub enum Icon {
     Gear,
     Sync,
     Comment,
+    Copy,
 }
 
 impl Icon {
-    const ALL: [(Icon, &'static [u8]); 12] = [
+    const ALL: [(Icon, &'static [u8]); 13] = [
         (Icon::Plus, include_bytes!("../assets/icons/plus.png")),
         (Icon::Close, include_bytes!("../assets/icons/close.png")),
         (Icon::More, include_bytes!("../assets/icons/more.png")),
@@ -182,6 +183,7 @@ impl Icon {
         (Icon::Gear, include_bytes!("../assets/icons/gear.png")),
         (Icon::Sync, include_bytes!("../assets/icons/sync.png")),
         (Icon::Comment, include_bytes!("../assets/icons/comment.png")),
+        (Icon::Copy, include_bytes!("../assets/icons/copy.png")),
     ];
 }
 
@@ -254,6 +256,14 @@ impl Icons {
             ui.add(image);
         }
     }
+}
+
+/// Gives a widget without visible text a name that screen readers announce.
+pub fn named(response: Response, name: &str) -> Response {
+    let enabled = response.enabled();
+    let name = name.to_owned();
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name));
+    response
 }
 
 /// Loads the embedded app icon as a texture for use inside the window.

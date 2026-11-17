@@ -734,7 +734,7 @@ fn dept_ui(
                         )
                         .map(egui::Button::image)
                         .unwrap_or_else(|| egui::Button::new("…"));
-                    egui::menu::menu_custom_button(ui, more, |ui| {
+                    let more = egui::menu::menu_custom_button(ui, more, |ui| {
                         if ui.button(t("Byt namn", "Rename")).clicked() {
                             out.push(BoardAction::EditText(
                                 part.id,
@@ -762,7 +762,10 @@ fn dept_ui(
                             out.push(BoardAction::DeletePart(part.id));
                             ui.close_menu();
                         }
-                    });
+                    })
+                    .response;
+                    theme::named(more, t("Fler val för delen", "More for the part"))
+                        .on_hover_text(t("Fler val", "More"));
                     let mut status = part.status;
                     egui::ComboBox::from_id_salt(("part_status", part.id))
                         .selected_text(
@@ -987,6 +990,15 @@ fn tag(painter: &egui::Painter, at: Pos2, text: &str, visuals: &egui::Visuals) {
     );
 }
 
+/// Adds the region if it is missing, removes it if it is there.
+fn toggle(regions: &mut Vec<String>, id: &str) {
+    if regions.iter().any(|r| r == id) {
+        regions.retain(|r| r != id);
+    } else {
+        regions.push(id.to_string());
+    }
+}
+
 fn canvas_ui(
     ui: &mut egui::Ui,
     board: &mut BoardUi,
@@ -995,6 +1007,10 @@ fn canvas_ui(
     out: &mut Vec<BoardAction>,
 ) {
     let dark = ui.visuals().dark_mode;
+    // The region a check box below points at, so that it lights up on the
+    // car for those who choose with the keyboard.
+    let mut listed: Option<&'static str> = None;
+    let mut toggled: Option<&'static str> = None;
     if let Some(place) = &board.place {
         let name = snapshot
             .departments
@@ -1017,8 +1033,36 @@ fn canvas_ui(
                     out.push(BoardAction::CancelPlace);
                 }
             });
+            // The same choice as check boxes, which also work from the keyboard.
+            ui.horizontal_wrapped(|ui| {
+                for region in &board.car.regions {
+                    let other = owner(snapshot, region.id).filter(|d| d.id != place.dept);
+                    let mut mine = place.regions.iter().any(|id| id == region.id);
+                    let response = ui.add_enabled(
+                        other.is_none(),
+                        egui::Checkbox::new(&mut mine, region.label()),
+                    );
+                    let response = match other {
+                        Some(d) => response.on_disabled_hover_text(format!(
+                            "{} {}",
+                            t("Hör till", "Belongs to"),
+                            truncate_chars(&one_line(&d.name), 40)
+                        )),
+                        None => response,
+                    };
+                    if response.has_focus() || response.hovered() {
+                        listed = Some(region.id);
+                    }
+                    if response.changed() {
+                        toggled = Some(region.id);
+                    }
+                }
+            });
         });
         ui.add_space(4.0);
+    }
+    if let (Some(id), Some(place)) = (toggled, board.place.as_mut()) {
+        toggle(&mut place.regions, id);
     }
 
     let mut available = ui.available_size();
@@ -1059,7 +1103,8 @@ fn canvas_ui(
     let hit = response
         .hover_pos()
         .or(response.interact_pointer_pos())
-        .and_then(|p| board.car.hit(map.canvas(p)));
+        .and_then(|p| board.car.hit(map.canvas(p)))
+        .or_else(|| listed.and_then(|id| board.car.regions.iter().find(|r| r.id == id)));
 
     if let Some(place) = board.place.as_mut() {
         let dept = snapshot.departments.iter().find(|d| d.id == place.dept);
@@ -1128,11 +1173,7 @@ fn canvas_ui(
                 };
             });
             if clicked && other.is_none() {
-                if mine {
-                    place.regions.retain(|id| id != region.id);
-                } else {
-                    place.regions.push(region.id.to_string());
-                }
+                toggle(&mut place.regions, region.id);
             }
         }
         return;
